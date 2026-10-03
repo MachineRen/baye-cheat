@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.12.0';
+    var CHEAT_VERSION = '1.12.1';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -68,6 +68,7 @@
 
         setupHooks();
         buildUI();
+        startSaveUiWatch();
 
         window.bayeCheat = {
             version: CHEAT_VERSION,
@@ -300,29 +301,62 @@
         } catch (e) { }
         return '';
     }
-    /* ---------- 存档位自动绑定（v1.12.0） ----------
+    /* ---------- 存档位自动绑定（v1.12.1） ----------
        引擎源码 lcd.js 的 bayeLoadFileContent(filename) 直接读
-       window.localStorage['baye//data//sango0.sav']（存档就存在 localStorage 里，
-       键名 = 存档文件名）。这是全局 JS 函数 → 包一层就知道引擎正在读哪个存档；
-       再加上 Storage.prototype.setItem 捕获「保存时写入哪个存档」。
-       于是槽位直接用**存档文件名本身**当键（save_sango0 / save_sango2 …），
-       与游戏自己的存档 1:1 绑定：不需要玩家任何手动操作，新增存档也自动生效。 */
-    var CUR_SAVE_LOAD = '';       /* 最近「读取」的存档（sango0） */
-    var CUR_SAVE_WRITE = '';      /* 最近「写入」的存档 */
-    function noteSaveName(fn) {
+       window.localStorage['baye//data//sango0.sav']，且是全局 JS 函数 → 可直接包。
+       实测读档流程（用户控制台日志）：
+           存档读取 0,2,4,6（存档列表枚举）→ 目标档(0/2/4) → fread → 配对档(1/3/5) → didLoadGame
+       即：偶数号与紧邻的奇数号是同一个存档的两份（0↔1、2↔3、4↔5、6↔7），
+       所以统一折算到偶数号，槽位标识就用它（save_sango0 / save_sango2 / save_sango4 …），
+       与游戏自己的存档 1:1 绑定，零手动操作。
+       两个状态要分清：
+         CUR_SAVE_SEEN   —— 最近读/写到的存档（面板显示用，可能还停在列表枚举阶段）
+         CUR_SAVE_ACTIVE —— 真正在玩的存档（didLoadGame / 写入时确定；数据一律按它落盘） */
+    var CUR_SAVE_SEEN = '', CUR_SAVE_ACTIVE = '', CUR_SAVE_LOGGED = '', SAVE_LOG_TIMER = null;
+    function normalizeSaveId(name) {
+        var m = /sango(\d+)/i.exec(String(name || ''));
+        if (!m) return '';
+        var n = parseInt(m[1], 10);
+        if (!isFinite(n)) return '';
+        return 'sango' + (n - (n % 2));           /* 折算到偶数号：sango1→sango0 */
+    }
+    function noteSaveName(fn, isWrite) {
         if (!fn) return '';
         var m = /(sango\d*)\.sav$/i.exec(String(fn));
         if (!m) return '';
-        if (CUR_SAVE_LOAD !== m[1]) {
-            CUR_SAVE_LOAD = m[1];
-            log('存档读取：' + m[1] + '.sav');
+        var id = normalizeSaveId(m[1]);
+        if (!id) return '';
+        if (isWrite) {
+            if (CUR_SAVE_ACTIVE !== id) { CUR_SAVE_ACTIVE = id; onActiveSaveChanged(id); }
+            CUR_SAVE_SEEN = id;
+        } else {
+            if (CUR_SAVE_SEEN !== id) { CUR_SAVE_SEEN = id; scheduleSaveLog(id); }
         }
-        return m[1];
+        return id;
     }
-    function currentSaveId() { return CUR_SAVE_WRITE || CUR_SAVE_LOAD || ''; }
+    /* 枚举 6 个文件会连着触发 → 合并成一条日志，不要刷屏 */
+    function scheduleSaveLog(id) {
+        if (SAVE_LOG_TIMER) clearTimeout(SAVE_LOG_TIMER);
+        SAVE_LOG_TIMER = setTimeout(function () {
+            SAVE_LOG_TIMER = null;
+            var line = '当前存档：' + id + '.sav　数据槽：' + currentSlot();
+            if (CUR_SAVE_LOGGED !== line) { CUR_SAVE_LOGGED = line; log(line); }
+            refreshSlotBtns();
+        }, 500);
+    }
+    /* 真正在玩的存档变了 → 立刻把强化/台账切到对应槽，并同步面板 */
+    function onActiveSaveChanged(id) {
+        var before = currentSlot();
+        try { loadSlotData(true); } catch (e) { }
+        if (currentSlot() !== before) {
+            log('存档切换：数据槽 ' + before + ' → ' + currentSlot() + '（已载入该存档的强化与台账）');
+        }
+        refreshSlotBtns();
+    }
+    function currentSaveId() { return CUR_SAVE_ACTIVE || CUR_SAVE_SEEN || ''; }
     function hookEngineSaveIO() {
         /* ① 包住引擎的存档读取入口。
-           真实形态：lcd.js 顶层 `function bayeLoadFileContent(filename)`（= window 上的全局函数），
+           真实形态：lcd.js 顶层 `function bayeLoadFileContent(filename)`（window 上的全局函数），
            引擎/WASM 通过这个名字调用；个别版本会挂在 baye 对象上，两处都试。 */
         try {
             var targets = [window, (typeof baye !== 'undefined' ? baye : null)];
@@ -332,7 +366,7 @@
                 if (t.bayeLoadFileContent.__bayeSaveHook) continue;
                 var host = t, of = t.bayeLoadFileContent;
                 var wrapped = function (filename) {
-                    try { noteSaveName(filename); } catch (e) { }
+                    try { noteSaveName(filename, false); } catch (e) { }
                     return of.apply(this, arguments);
                 };
                 wrapped.__bayeSaveHook = 1;
@@ -345,9 +379,7 @@
             if (sp && typeof sp.setItem === 'function' && !sp.setItem.__bayeSaveHook) {
                 var os = sp.setItem;
                 var ws = function (k, v) {
-                    var r = '';
-                    try { r = noteSaveName(k) || ''; } catch (e2) { }
-                    if (r && CUR_SAVE_WRITE !== r) { CUR_SAVE_WRITE = r; log('存档写入：' + r + '.sav'); }
+                    try { noteSaveName(k, true); } catch (e2) { }
                     return os.apply(this, arguments);
                 };
                 ws.__bayeSaveHook = 1;
@@ -2256,17 +2288,23 @@
     }
 
     function onDidOpenNewGame() {
+        /* 新开局：在第一次保存之前没有存档身份 → 回到临时槽 */
+        CUR_SAVE_ACTIVE = '';
         resetRunState(true);
+        refreshSlotBtns();
         return undefined;
     }
 
     function onDidLoadGame() {
-        /* 读档：按引擎实际读到的存档文件名切换数据槽（自动，无需任何手动操作） */
-        var before = currentSlot();
+        /* 读档：把「真正在玩的存档」定下来（此时引擎刚读完目标档与其配对档），
+           数据槽随之切换 —— 全自动，玩家无需任何操作 */
         try { hookEngineSaveIO(); } catch (e) { }
-        try { loadSlotData(true); } catch (e) { }
-        if (currentSlot() !== before) {
-            log('读档：数据槽 ' + before + ' → ' + currentSlot() + '（已载入该存档的强化与台账）');
+        var seen = CUR_SAVE_SEEN;
+        if (seen && CUR_SAVE_ACTIVE !== seen) {
+            CUR_SAVE_ACTIVE = seen;
+            onActiveSaveChanged(seen);
+        } else {
+            try { loadSlotData(true); } catch (e2) { }
         }
         /* 「全员满级」是读档即生效的（不是每月累积），所以放在这里 */
         try { if (flag('levelBoostAll')) levelUpAll(false, true); } catch (e) { }
@@ -3898,11 +3936,27 @@
         if (el) el.textContent = currentSlot() + '（选择：' + slotSelection() + '）';
         var sv = document.getElementById('bayeCheatSaveNow');
         if (sv) {
-            var list = engineSaveList();
-            sv.textContent = (currentSaveId() ? currentSaveId() + '.sav' : '识别中…')
-                + '　（存档共 ' + list.length + ' 个：'
-                + list.map(function (x) { return x.name; }).join('/') + '）';
+            var list = engineSaveList(), uniq = [], i;
+            for (i = 0; i < list.length; i++) if (uniq.indexOf(list[i].name) < 0) uniq.push(list[i].name);
+            sv.textContent = (currentSaveId() ? currentSaveId() + '.sav' : '未识别（tmp 临时槽）')
+                + '　（存档 ' + uniq.length + ' 个：' + uniq.join('/') + '）';
         }
+    }
+    /* 面板是注入时一次性渲染的，存档切换发生在之后 → 必须持续同步，
+       否则面板会一直停在「识别中…」。这里每秒只比对两个字符串，代价可忽略。 */
+    var SAVE_UI_TICK = null;
+    function startSaveUiWatch() {
+        if (SAVE_UI_TICK) return;
+        var lastSeen = '', lastSlot = '';
+        SAVE_UI_TICK = setInterval(function () {
+            try {
+                var s = currentSaveId(), sl = currentSlot();
+                if (s !== lastSeen || sl !== lastSlot) {
+                    lastSeen = s; lastSlot = sl;
+                    refreshSlotBtns();
+                }
+            } catch (e) { }
+        }, 1000);
     }
     function slotSelection() {
         try { return localStorage.getItem(SLOT_KEY) || 'auto'; } catch (e) { return 'auto'; }

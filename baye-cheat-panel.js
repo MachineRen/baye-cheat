@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.11.4';
+    var CHEAT_VERSION = '1.11.5';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -2820,11 +2820,17 @@
         var ids = ownGenerals(false);
         var cap = capitalCity();
         var capName = cap >= 0 ? cityName(cap) : '（无城）';
-        var capMoney = cap >= 0 ? (cityAt(cap).Money || 0) : 0;
+        var purse = 0, full = 0, my = ownCities((baye.data.g_PlayerKing || 0) + 1), pc;
+        for (var pi = 0; pi < my.length; pi++) {
+            pc = cityAt(my[pi]); if (!pc) continue;
+            purse += (pc.Money || 0);
+            if ((pc.Money || 0) >= MONEY_SOFT_CAP) full++;
+        }
         var lines = [
             '资源管理',
             '',
-            '都城 ' + capName + '　金币 ' + capMoney + '/' + MONEY_SOFT_CAP,
+            '都城 ' + capName + '　势力金币合计 ' + purse + '（' + my.length + ' 座城'
+                + (full ? '，其中 ' + full + ' 座已满' : '') + '，单城上限 ' + MONEY_SOFT_CAP + '）',
             '己方武将 ' + ids.length + ' 名　等级上限 ' + MAX,
             ''
         ];
@@ -2888,25 +2894,58 @@
         return -1;
     }
 
-    /* 引擎金币上限：原版机制 Money>30000 截断，按上限夹紧。 */
+    /* 引擎金币上限：原版机制 Money>30000 截断。
+       但不再只信硬编码 —— setCityMoney 每次写完会回读，一旦发现引擎实际给的更少，
+       就把上限自动校准成引擎的真实值（避免「以为加了 3000，引擎只让进 1」）。 */
     var MONEY_SOFT_CAP = 30000;
 
+    /* 给单座城加钱（写后回读校准）。返回 { got, before, after, capped } */
+    function setCityMoney(city, want) {
+        if (!city) return { got: 0, before: 0, after: 0, capped: true };
+        var before = Number(city.Money) || 0;
+        if (before >= MONEY_SOFT_CAP) return { got: 0, before: before, after: before, capped: true };
+        var after = Math.min(MONEY_SOFT_CAP, before + want);
+        city.Money = after;
+        var real = Number(city.Money);
+        if (!isFinite(real) || real < 0) real = after;
+        if (real < after) {
+            /* 引擎有更低的硬上限 → 校准上限，再按真实值补一次 */
+            MONEY_SOFT_CAP = real;
+            city.Money = Math.min(real, before + want);
+            real = Number(city.Money) || 0;
+        }
+        return { got: real - before, before: before, after: real, capped: real < before + want };
+    }
+
+    /* 一夜暴富 / 资源管理「立即加钱」：
+       都城优先，都城满了自动接着给其他己方城池（v1.11.5：以前只给都城一座，
+       都城一旦到上限就几乎加不进去，用户看到的就是「只+1」）。
+       汇报时逐城列出 before→after，并明确告知是否有剩余没发出去。 */
     function doRich(silent, force) {
         if (!flag('richMode') && !force) return 0;   /* 资源管理菜单手动点击时 force=true，不依赖月度开关 */
         var c = capitalCity();
         if (c < 0) { if (!silent) alert2('没有己方城池，无法增加金钱'); return 0; }
-        var city = cityAt(c);
         var want = Math.max(0, Math.round(safeWeight('richAmount', 3000)));
-        var before = city.Money || 0;
-        /* 夹到上限：引擎会把超出的部分直接截掉，先算最终能到多少 */
-        var after = Math.min(MONEY_SOFT_CAP, before + want);
-        city.Money = after;
-        var got = after - before;
-        if (!silent) {
-            alert2(cityName(c) + ' 增加金钱 ' + got + '\n（' + before + ' → ' + after
-                + '，单城上限 ' + MONEY_SOFT_CAP + '）');
+        if (!want) { if (!silent) alert2('暴富金额为 0，未发放（可在金手指面板里改）'); return 0; }
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var order = [c], i, list = ownCities(myKing);
+        for (i = 0; i < list.length; i++) if (list[i] !== c) order.push(list[i]);
+        var left = want, total = 0, notes = [], short = false;
+        for (i = 0; i < order.length && left > 0; i++) {
+            var r = setCityMoney(cityAt(order[i]), left);
+            if (r.got > 0) { total += r.got; left -= r.got; notes.push(cityName(order[i]) + ' ' + r.before + '→' + r.after); }
+            if (r.capped) short = true;
         }
-        return got;
+        if (!silent) {
+            var msg = '增加金钱 ' + total + '（计划 ' + want + '）\n' + (notes.length ? notes.join('\n') : '（没有可加的城）')
+                + '\n单城上限 ' + MONEY_SOFT_CAP;
+            if (left > 0) {
+                msg += '\n⚠ 己方城池金币已到上限，剩余 ' + left + ' 没能发放 —— '
+                    + '先花掉一些或等月入积累；也可在面板把「暴富金额」调小到剩余空间以内';
+            }
+            alert2(msg);
+        }
+        return total;
     }
 
     /* ---------- 武将等级提升 ---------- */
@@ -3126,8 +3165,8 @@
         { k: 'noDisaster', t: '城池无灾害', d: '默认关闭（尊重原机制）。开启后每月把己方城池防灾值拉满并清除已有的饥荒/旱灾/水灾/暴动' },
         { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（等级不设上限），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
         { k: 'forgePity', t: '强化保底', d: '默认开启。连续失败 5 次后下一次必定成功，避免高等级陷入无限掉级（+11 以上成功率仅 18%~9%）' },
-        { k: 'richMode', t: '一夜暴富', d: '每月给君主所在城加一笔钱。引擎金币上限（单城 30000），默认加 3000 —— 刚好够立刻买商店里 3000 金的道具' },
-        { k: 'richAmount', t: '暴富金额', d: '一夜暴富每月注入的钱数。引擎会截断超过 30000 的部分' },
+        { k: 'richMode', t: '一夜暴富', d: '每月给君主所在城加钱，都城满了会自动接着给其他己方城池。引擎金币上限会自动按实际写入值校准（默认 30000/城）' },
+        { k: 'richAmount', t: '暴富金额', d: '一夜暴富每月注入的钱数。发放时会逐城列出实际到账金额；若所有己方城池都到上限，剩余部分不会发放并会提示' },
         { k: 'allTools', t: '获取全部道具', d: '每月把道具表里所有「真实存在的道具」（已按名字过滤空槽位）投放到君主所在城。想一次性给全请用游戏内「资源管理」' },
         { k: 'levelBoost', t: '武将等级提升', d: '每月给全部己方武将 +30 经验（引擎经验条满 100 即升 1 级，等级上限由引擎 maxLevel 决定，默认 30）' },
         { k: 'levelBoostAll', t: '全员满级（读档即生效）', d: '默认关。开启后每次读档 / 新开局，自动把全部己方武将直接拉到等级上限。也可在游戏内「资源管理」手动一键满级' },

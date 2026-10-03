@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.11.9';
+    var CHEAT_VERSION = '1.12.0';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -38,8 +38,8 @@
     var TIMER = null;
 
     function bootstrap() {
-        /* 尽早挂上存档文件监听：读档发生在玩家点「读档」时，
-           必须在 install 之前就位，否则抓不到当前载入的是哪个 .sav。 */
+        /* 尽早装上存档识别钩子（引擎读/写存档时立刻能知道是哪个 .sav） */
+        try { hookEngineSaveIO(); } catch (e) { }
         try { hookSaveLoaders(); } catch (e) { }
         /* 页面在 lib 脚本 eval 之前尚未建立 baye.data，故分两条路径：
            · 早注入 → 挂 preScriptInit，等引擎初始化完成后再装钩子；
@@ -144,6 +144,9 @@
                 bindCurrent: bindCurrentSlot,
                 fingerprint: gameFingerprint,
                 saveKeys: storageSaveKeys,
+                currentSave: currentSaveId,
+                engineSaves: engineSaveList,
+                reeHook: hookEngineSaveIO,
                 moneyCap: function () { return MONEY_SOFT_CAP; },
                 probeMoneyCap: probeMoneyCap,
                 /* 换月/读档时清空「本月已打过」账本；控制台与测试也用它复位 */
@@ -297,12 +300,105 @@
         } catch (e) { }
         return '';
     }
+    /* ---------- 存档位自动绑定（v1.12.0） ----------
+       引擎源码 lcd.js 的 bayeLoadFileContent(filename) 直接读
+       window.localStorage['baye//data//sango0.sav']（存档就存在 localStorage 里，
+       键名 = 存档文件名）。这是全局 JS 函数 → 包一层就知道引擎正在读哪个存档；
+       再加上 Storage.prototype.setItem 捕获「保存时写入哪个存档」。
+       于是槽位直接用**存档文件名本身**当键（save_sango0 / save_sango2 …），
+       与游戏自己的存档 1:1 绑定：不需要玩家任何手动操作，新增存档也自动生效。 */
+    var CUR_SAVE_LOAD = '';       /* 最近「读取」的存档（sango0） */
+    var CUR_SAVE_WRITE = '';      /* 最近「写入」的存档 */
+    function noteSaveName(fn) {
+        if (!fn) return '';
+        var m = /(sango\d*)\.sav$/i.exec(String(fn));
+        if (!m) return '';
+        if (CUR_SAVE_LOAD !== m[1]) {
+            CUR_SAVE_LOAD = m[1];
+            log('存档读取：' + m[1] + '.sav');
+        }
+        return m[1];
+    }
+    function currentSaveId() { return CUR_SAVE_WRITE || CUR_SAVE_LOAD || ''; }
+    function hookEngineSaveIO() {
+        /* ① 包住引擎的存档读取入口。
+           真实形态：lcd.js 顶层 `function bayeLoadFileContent(filename)`（= window 上的全局函数），
+           引擎/WASM 通过这个名字调用；个别版本会挂在 baye 对象上，两处都试。 */
+        try {
+            var targets = [window, (typeof baye !== 'undefined' ? baye : null)];
+            for (var ti = 0; ti < targets.length; ti++) {
+                var t = targets[ti];
+                if (!t || typeof t.bayeLoadFileContent !== 'function') continue;
+                if (t.bayeLoadFileContent.__bayeSaveHook) continue;
+                var host = t, of = t.bayeLoadFileContent;
+                var wrapped = function (filename) {
+                    try { noteSaveName(filename); } catch (e) { }
+                    return of.apply(this, arguments);
+                };
+                wrapped.__bayeSaveHook = 1;
+                try { host.bayeLoadFileContent = wrapped; } catch (e2) { }
+            }
+        } catch (e3) { }
+        /* ② 包住 localStorage 写入：引擎保存时会写自己的存档键 */
+        try {
+            var sp = (typeof Storage !== 'undefined') ? Storage.prototype : null;
+            if (sp && typeof sp.setItem === 'function' && !sp.setItem.__bayeSaveHook) {
+                var os = sp.setItem;
+                var ws = function (k, v) {
+                    var r = '';
+                    try { r = noteSaveName(k) || ''; } catch (e2) { }
+                    if (r && CUR_SAVE_WRITE !== r) { CUR_SAVE_WRITE = r; log('存档写入：' + r + '.sav'); }
+                    return os.apply(this, arguments);
+                };
+                ws.__bayeSaveHook = 1;
+                sp.setItem = ws;
+            }
+        } catch (e3) { }
+    }
+    /* 存档文件清单（localStorage 里真实存在的） */
+    function engineSaveList() {
+        var out = [], i, k;
+        try {
+            for (i = 0; i < localStorage.length; i++) {
+                k = localStorage.key(i);
+                if (k && /sango\d*\.sav$/i.test(k)) {
+                    out.push({ name: (/(sango\d*)\.sav$/i.exec(k) || [, '?'])[1], key: k, size: (localStorage.getItem(k) || '').length });
+                }
+            }
+        } catch (e) { }
+        return out;
+    }
+    /* 存档位 → 存储键里的槽标识。存档位直接用存档文件名（save_sango0），
+       这样强化/台账天然跟着游戏那个存档走。 */
+    function slotIdOf(saveId) { return saveId ? ('save_' + saveId) : ''; }
+
     function currentSlot() {
         var sel = 'auto';
         try { sel = localStorage.getItem(SLOT_KEY) || 'auto'; } catch (e) { }
         if (sel === 'tmp') return 'tmp';
         if (sel === '1' || sel === '2' || sel === '3') return 'slot' + sel;
-        return autoSlotId() || 'tmp';
+        /* 自动：URL 参数 → 引擎字段 → 存档文件名（最可靠）→ 旧指纹绑定 → tmp */
+        try {
+            var m = /[?&](?:slot|save|s)=([0-9]+)/i.exec(String((window.location && window.location.search) || ''));
+            if (m) return 'slot' + m[1];
+            var d = baye.data, ks = ['g_SaveSlot', 'g_SaveIndex', 'g_SaveNo', 'g_SaveID', 'g_SlotIndex'], i, v, n;
+            for (i = 0; i < ks.length; i++) {
+                v = d[ks[i]];
+                if (v !== undefined && v !== null && v !== '' && isFinite(Number(v))) {
+                    n = Number(v);
+                    return 'slot' + (n > 0 ? n : 1);
+                }
+            }
+        } catch (e2) { }
+        var sid = slotIdOf(currentSaveId());
+        if (sid) return sid;
+        try {
+            var sb = slotFromBinding();
+            if (sb) return 'slot' + sb;
+            var sf = slotFromSaveFile();
+            if (sf) return 'slot' + sf;
+        } catch (e3) { }
+        return 'tmp';
     }
     function skey(name) { return 'baye_cheat_' + currentSlot() + '_' + name; }
     /* 旧版无槽前缀的键：首次按当前槽落一份，避免历史强化等级/台账丢失 */
@@ -351,21 +447,24 @@
             deaths = JSON.parse(localStorage.getItem(skey('deaths_v1')) || '[]') || [];
         } catch (e5) { deaths = []; }
     }
-    /* 存档键候选（诊断用）：localStorage 扫描 + 实际读过的 .sav 文件 */
+    /* 存档诊断：引擎的存档就在 localStorage 里（键名 = 存档文件名） */
     function storageSaveKeys() {
-        var out = [], i, k, v;
+        var out = [], i, k, v, list = engineSaveList();
+        for (i = 0; i < list.length; i++) {
+            out.push('存档 ' + list[i].name + '.sav（' + Math.round(list[i].size / 1024) + 'KB'
+                + (list[i].name === currentSaveId() ? '，← 当前' : '') + '）');
+        }
         try {
             for (i = 0; i < localStorage.length; i++) {
                 k = localStorage.key(i);
-                if (!k || k.indexOf('baye_cheat_') === 0) continue;
+                if (!k || k.indexOf('baye_cheat_') === 0 || /sango\d*\.sav$/i.test(k)) continue;
                 v = localStorage.getItem(k) || '';
                 if (/save|slot|存档|进度/i.test(k) || (v.length > 2000 && /^\s*[{[]/.test(v))) {
-                    out.push('LS ' + k + '(' + Math.round(v.length / 1024) + 'KB)');
+                    out.push('其他 ' + k + '(' + Math.round(v.length / 1024) + 'KB)');
                 }
             }
         } catch (e) { }
-        for (i = 0; i < SAVE_FILES.length; i++) out.push('SAV ' + SAVE_FILES[i] + ' → 槽' + (i + 1));
-        if (!out.length) out.push('（未抓到：引擎的 baye/data/*.sav 由 WASM 内部发起请求读取，JS 拦不到；请用面板「把当前档标记为槽N」或带槽位书签）');
+        if (!out.length) out.push('（localStorage 里还没有存档条目：先在游戏里保存一次）');
         return out;
     }
 
@@ -2162,12 +2261,12 @@
     }
 
     function onDidLoadGame() {
-        /* 读档：按「君主+都城」指纹/URL 参数切到该存档位的数据
-           （新档期落在 tmp 的强化/台账会并到真实档位） */
+        /* 读档：按引擎实际读到的存档文件名切换数据槽（自动，无需任何手动操作） */
         var before = currentSlot();
+        try { hookEngineSaveIO(); } catch (e) { }
         try { loadSlotData(true); } catch (e) { }
         if (currentSlot() !== before) {
-            log('读档：存档槽位 ' + before + ' → ' + currentSlot() + '（已载入该档的强化与台账）');
+            log('读档：数据槽 ' + before + ' → ' + currentSlot() + '（已载入该存档的强化与台账）');
         }
         /* 「全员满级」是读档即生效的（不是每月累积），所以放在这里 */
         try { if (flag('levelBoostAll')) levelUpAll(false, true); } catch (e) { }
@@ -3572,18 +3671,13 @@
             + '· 粮草差另计 ±15%。原版只比总兵力且 16 位求和会溢出（10.4 万兵溢出成 3.8 万），这就是「一将挡八将」的根源。'
             + '</div>';
         html += '<h4>存档与资源</h4>'
-            + '<div class="tip" style="text-align:left">强化等级与阵亡台账按<b>存档位</b>分开保存（三个档位互不干扰）；'
-            + '新开的档在保存之前先落在<b>临时槽</b>。<b>当前生效槽位：<span id="bayeCheatSlotNow">?</span></b><br>'
-            + '引擎的存档是 <code>baye/data/sango*.sav</code> 文件，由引擎内部通过 WASM 发起请求读取，'
-            + '网页脚本拦不到，所以自动识别有两条路：<b>①</b> 下面「把当前这个档标记为槽N」，'
-            + '标记过一次之后按「君主+都城」自动对上（三个档各标记一次即可长期自动）；'
-            + '<b>②</b> 用说明页里的<b>带槽位书签</b>，点哪个档就用哪个槽。</div>'
+            + '<div class="tip" style="text-align:left">强化等级与阵亡台账<b>自动跟着游戏存档走</b>：'
+            + '引擎读/写存档时我们能直接认出是哪个存档文件，存档数据就存在同一标识下，'
+            + '三个存档互不干扰，<b>不需要任何手动操作</b>。新开的档在首次保存之前落在<b>临时槽</b>。<br>'
+            + '当前游戏存档：<b id="bayeCheatSaveNow">识别中…</b>　数据槽：<b id="bayeCheatSlotNow">?</b></div>'
             + '<div class="fn" id="bayeCheatSlot">'
             + slotBtn('auto', '自动') + slotBtn('tmp', '临时') + slotBtn('1', '槽1') + slotBtn('2', '槽2') + slotBtn('3', '槽3')
             + '</div>'
-            + '<div class="sublabel">把当前读入的存档标记为（三个档各点一次，以后全自动）</div>'
-            + '<div class="fn" id="bayeCheatBind">'
-            + bindBtn(1) + bindBtn(2) + bindBtn(3) + '</div>'
             + '<div class="nums" style="margin-top:8px">' + num('moneyCap', '金币上限(0=自动)', 0) + '</div>'
             + '<div class="fn"><button data-fn="probeCap">重新探测金币上限</button></div>'
             + '<div class="tip" style="text-align:left">若「立即加钱」加不进去，多半是金币已到引擎硬上限。点「重新探测金币上限」会实测引擎真正的上限；也可手动填上限（0 = 跟随实测值）。</div>';
@@ -3686,6 +3780,7 @@
             };
         });
         syncNumInputs();
+        refreshSlotBtns();
         each(wrap.querySelectorAll('#bayeCheatSm .sm'), function (b) {
             b.onclick = function () {
                 var v = Number(this.getAttribute('data-sm'));
@@ -3800,10 +3895,13 @@
             b.classList.toggle('on', b.getAttribute('data-slot') === slotSelection());
         });
         var el = document.getElementById('bayeCheatSlotNow');
-        if (el) {
-            var fp = gameFingerprint();
-            el.textContent = currentSlot() + '（选择：' + slotSelection()
-                + (slotSelection() === 'auto' ? (fp ? '，本局特征 ' + fp : '，未绑定特征') : '') + '）';
+        if (el) el.textContent = currentSlot() + '（选择：' + slotSelection() + '）';
+        var sv = document.getElementById('bayeCheatSaveNow');
+        if (sv) {
+            var list = engineSaveList();
+            sv.textContent = (currentSaveId() ? currentSaveId() + '.sav' : '识别中…')
+                + '　（存档共 ' + list.length + ' 个：'
+                + list.map(function (x) { return x.name; }).join('/') + '）';
         }
     }
     function slotSelection() {

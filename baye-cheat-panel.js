@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.11.1';
+    var CHEAT_VERSION = '1.11.2';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -129,6 +129,15 @@
                 maxLevel: maxLevelOf,
                 toolTypeName: toolTypeName,
                 toolForgeable: toolForgeable,
+                /* v1.11.2：道路/名册诊断（跨城进攻、君主错列都是靠这两条查的） */
+                adjacencyReady: adjReady,
+                isAdjacent: isAdjacent,
+                adjOf: adjOf,
+                launchAttack: launchAttack,
+                repairRoster: repairCityRoster,
+                /* 换月/读档时清空「本月已打过」账本；控制台与测试也用它复位 */
+                resetAttackLog: function () { ATTACKED.month = ''; ATTACKED.targets = {}; return true; },
+                showMonthReport: showMonthReport,
                 sidePowerOf: function (pid) { return genPower(pid); }
             },
             /* 重复挂载钩子（幂等）：只在钩子已被外部改写时重装，
@@ -339,6 +348,10 @@
        回调索引映射回原始条目：长行折行后列表会变长，若不映射，
        点「花钱强化？」「再强化一次？」这类按索引判断的按钮就会错位失效。 */
     function menu(items, init, cb) {
+        /* 无回调也要能开菜单（查看月报/排行/图鉴/版本等都是纯展示）——
+           少了这一层守卫，v1.11.1 的索引映射包装会在取消时抛
+           「cb is not a function」并把引擎菜单状态机卡死。 */
+        if (typeof cb !== 'function') cb = function () { };
         var fit = fitMenuLines(items);
         baye.centerChoose(SW() - 8, SH() - 8, fit.lines, init || 0, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) { cb(ind); return; }
@@ -643,6 +656,93 @@
         return a.concat(b);
     }
 
+    /* ---------- 5.7 城池名册一致性自愈（v1.11.2） ----------
+       现象：君主同时出现在两座城（截图里徐州君主陶谦却出现在马腾的汉中）。
+       成因：君主被俘→转移、被俘→回滚、跨城回防、俘虏转武将这几条路径，
+       只要有一步没把旧城的名册条目删干净，引擎的城池名册
+      （g_PersonsQueue 的切片 PersonQueue/Persons）就会留下幽灵条目；
+       而引擎自己不做一致性检查，于是「某城武将列表里冒出别势力的君主」。
+       每月月初扫一遍：Belong 与所在城不一致就纠正，同一人出现在多城只留一处。 */
+    function repairCityRoster(verbose) {
+        var cities = baye.data.g_Cities, i, j, fixed = [];
+        var where = {};        /* pid -> [城号, 城号…] */
+        var p, pid, list, b;
+        /* 第一遍：只统计每个人出现在哪几座城的名册里，不做任何改动 */
+        for (i = 0; i < cities.length; i++) {
+            if (!cities[i]) continue;
+            list = personsOfCity(i);
+            for (j = 0; j < list.length; j++) {
+                pid = list[j];
+                p = personAt(pid);
+                if (p && !p.Level) continue;
+                if (!where[pid]) where[pid] = [];
+                where[pid].push(i);
+            }
+        }
+        /* 第二遍：按「归属」决定去留 —— 保留城池归属与其 Belong 一致的那座，
+           其余从名册移除；君主（Belong 指向自己）另作归位处理。 */
+        for (pid in where) {
+            if (!where.hasOwnProperty(pid)) continue;
+            pid = Number(pid);
+            p = personAt(pid);
+            list = where[pid];
+            if (!p) {                                   /* 空数据：全部清掉 */
+                for (j = 0; j < list.length; j++) { try { baye.deletePersonInCity(list[j], pid); } catch (e) { } }
+                fixed.push('#' + pid + ' 空数据已清理');
+                continue;
+            }
+            b = p.Belong;
+            var keeper = -1, k;
+            if (b !== WILD && b !== CAPTIVE && b !== undefined && b > 0) {
+                for (k = 0; k < list.length; k++) {
+                    if (cities[list[k]] && cities[list[k]].Belong === b) { keeper = list[k]; break; }
+                }
+            } else if (list.length) {
+                keeper = list[0];                        /* 在野/俘虏：保留首个 */
+            }
+            if (keeper < 0) keeper = list[0];
+            /* 重复在册：只留 keeper */
+            for (k = 0; k < list.length; k++) {
+                if (list[k] === keeper) continue;
+                try { baye.deletePersonInCity(list[k], pid); } catch (e2) { }
+                fixed.push(nameOf(pid) + ' 重复在册（' + cityName(keeper) + '/' + cityName(list[k]) + '）');
+            }
+            if (list.length > 1) continue;
+            /* 单一在册：检查归属是否与城池一致 */
+            if (b === WILD || b === CAPTIVE || b === undefined || b <= 0) continue;
+            if (cities[keeper] && cities[keeper].Belong === b) continue;
+            if (pid + 1 === b) {
+                var oc = ownCities(b);
+                if (oc.length) {
+                    try { baye.deletePersonInCity(keeper, pid); } catch (e3) { }
+                    placePerson(oc[0], pid);
+                    fixed.push(nameOf(pid) + ' 君主归位（' + cityName(keeper) + '→' + cityName(oc[0]) + '）');
+                } else {
+                    try { baye.deletePersonInCity(keeper, pid); } catch (e4) { }
+                    fixed.push(nameOf(pid) + ' 君主无城可归，已移出 ' + cityName(keeper));
+                }
+                continue;
+            }
+            /* 普通武将错列：引擎若在别处也登记了他，以那边为准；否则视为中间态，不动 */
+            var home = -1, c2;
+            for (c2 = 0; c2 < cities.length; c2++) {
+                if (c2 === keeper || !cities[c2] || cities[c2].Belong !== b) continue;
+                if (personsOfCity(c2).indexOf(pid) >= 0) { home = c2; break; }
+            }
+            if (home >= 0) {
+                try { baye.deletePersonInCity(keeper, pid); } catch (e5) { }
+                fixed.push(nameOf(pid) + ' 错列于' + cityName(keeper) + '，已移出该城名册');
+            } else {
+                fixed.push(nameOf(pid) + ' 暂留' + cityName(keeper) + '（归属' + safeName(b) + '，等引擎结算）');
+            }
+        }
+        if (fixed.length) {
+            pushReport('【名册】' + fixed.slice(0, 3).join('；') + (fixed.length > 3 ? ' 等' + fixed.length + '处' : ''));
+            if (verbose) alert2('【名册修复】\n' + fixed.join('\n'));
+        }
+        return fixed;
+    }
+
     /* ---------- 5.4 需求5：AI 托管战斗加权结算 ----------
        引擎 src/FgtCount.c FgtCountWon()（电脑打电脑专用）只看两项：
            总兵力 FgtAllArms()（U16 求和，还会溢出）与粮草，
@@ -820,7 +920,7 @@
                 var defKing0 = safeName(cityAt(fp.CityIndex) && cityAt(fp.CityIndex).Belong) || cityName(fp.CityIndex);
                 if (!defKing0) defKing0 = cityName(fp.CityIndex) || '守方';
                 pushReport('【战】' + atkKing0 + '军 进攻 ' + cityName(fp.CityIndex)
-                    + '（' + defKing0 + '军），' + (win ? '城破' : '击退'));
+                    + '（' + defKing0 + '军），' + (win ? '城破' : '击退') + oddAttackTag(fp));
             } catch (e) { log('托管战报异常', e); }
 
             if (cfg.verbose) {
@@ -857,6 +957,21 @@
     var battleRosters = [];       /* 当月每场战斗的参战名单 { city, pids, month } */
     var diag = { fightCountWinner: 0, exitBattle: 0, autoBattlesRecorded: 0, applyDeathRate: 0, deathsApplied: 0 };
 
+    /* 战报异常标记：攻方主帅此刻在城里、且该城与目标城不相邻 → 说明这一仗越过了道路。
+       行军途中的人不在任何城的名册里（cityOfPerson 返回 0xff），不会误报。
+       用途：把「引擎自己打的越界仗」和「我们 AI 打的」区分开，方便定位。 */
+    function oddAttackTag(fp, atkPid) {
+        try {
+            if (!fp || !adjReady()) return '';
+            var pid = (atkPid !== undefined) ? atkPid : (fp.GenArray[0] ? fp.GenArray[0] - 1 : -1);
+            if (pid < 0) return '';
+            var from = cityOfPerson(pid);
+            if (from === 0xff || from === fp.CityIndex) return '';
+            if (isAdjacent(from, fp.CityIndex)) return '';
+            return '　【异常】' + cityName(from) + '与' + cityName(fp.CityIndex) + '不相邻';
+        } catch (e) { return ''; }
+    }
+
     function onExitBattle() {
         diag.exitBattle += 1;
         /* 先记战报与参战名单 —— 后面的君主保护会把获救者从战场队列里摘走（槽位清零），
@@ -884,7 +999,7 @@
                 battleRosters.push({ city: fp.CityIndex, pids: pids, month: monthKey(), result: baye.data.g_FgtOver });
                 /* 战斗当场就写月报，每场都记（不等月末，避免一个月只留最后一场） */
                 pushReport('【战】' + atkKing + '军 进攻 ' + cityName(fp.CityIndex)
-                    + '（' + defKing + '军），' + res);
+                    + '（' + defKing + '军），' + res + oddAttackTag(fp, atkPid));
             }
         } catch (e) { log('战斗记录异常', e); }
         applyEngineSwitches();
@@ -1088,6 +1203,8 @@
                 try { notes = notes.concat(rescueLostGenerals(false) || []); } catch (e) { }
             }
             try { notes = notes.concat(rollbackCapturedKings(true) || []); } catch (e) { }
+            /* 名册自愈：君主/武将错列、重复在册（被俘转移、跨城回防等路径的残留） */
+            try { repairCityRoster(false); } catch (e) { }
         }
         applyEngineSwitches();
         try { if (flag('noDeath') || flag('noDeathRescue')) snapshot(); } catch (e) { }
@@ -1281,6 +1398,54 @@
        过去占领（原版打空城本来就没有战斗，BattleDrv 里 `if (!ob)` 直接占领）。 */
     /* 城池邻接表（提取自平衡版2.1 dat.xml 的「路径」字段，38 城，顺序 = 城编号） */
     var CITY_ADJ = [[3], [2, 7, 6], [1], [8, 0], [5, 10], [6, 11, 4], [1, 12, 5], [13, 1], [9, 14, 3], [10, 8], [4, 15, 20, 14, 9], [5, 12, 15], [6, 13, 16, 11], [7, 18, 17, 12], [8, 10, 20, 19], [11, 16, 21, 10], [12, 22, 15], [13, 18, 22], [17, 13], [14, 24], [10, 21, 26, 14], [15, 22, 20], [17, 23, 29, 28, 21, 16], [22], [19, 25, 31, 30], [24], [20, 27, 33, 32], [28, 33, 26], [22, 34, 27], [34, 22], [24], [32, 24], [26, 35, 31], [27, 34, 36, 26], [29, 37, 33, 28], [36, 32], [33, 37, 35], [34, 36]];
+    /* 邻接表的城市名（与 CITY_ADJ 同序，来源：city-adj.json）。
+       我们是绕过引擎的指令校验直接写出征单（launchAttack 里OrderId=27），
+       所以一旦 MOD/剧本换了地图或改了城名，索引就会错位 → 出现「北平的公孙瓒打梓潼」这种
+       跨地图进攻。引擎不提供运行时邻接接口，只能靠城名自查：对不上就整表停用，
+       宁可 AI 这个月不出征，也不能让它乱打。 */
+    var CITY_ADJ_NAMES = ["西凉", "北平", "襄平", "安定", "晋阳", "平原", "南皮", "北海", "天水", "河内", "长安", "邺", "濮阳", "徐州", "汉中", "洛阳", "许昌", "小沛", "下邳", "梓潼", "宛城", "寿春", "建业", "吴", "成都", "绵竹", "襄阳", "江夏", "庐江", "会稽", "云南", "巴郡", "武陵", "长沙", "柴桑", "零陵", "桂阳", "建宁"];
+    var ADJ_OK = null;
+    function adjReady() {
+        if (ADJ_OK !== null) return ADJ_OK;
+        try {
+            var n = baye.data.g_Cities.length, i, bad = [];
+            /* 只比对当前地图实际存在的城；城数比内置表还多 → 地图是另一张，一律停用 */
+            if (n > CITY_ADJ_NAMES.length) {
+                ADJ_OK = false;
+                log('当前地图 ' + n + ' 城与内置邻接表（' + CITY_ADJ_NAMES.length + ' 城）不是同一张，已停用 AI 自主出征');
+                return ADJ_OK;
+            }
+            for (i = 0; i < n; i++) {
+                if (cityName(i) !== CITY_ADJ_NAMES[i]) bad.push('#' + i + ' ' + CITY_ADJ_NAMES[i] + '≠' + cityName(i));
+            }
+            ADJ_OK = (bad.length === 0);
+            if (!ADJ_OK) {
+                log('城池邻接表与当前地图不符（' + bad.length + ' 处），已停用 AI 自主出征：' + bad.slice(0, 5).join('、'));
+            }
+        } catch (e) { ADJ_OK = false; }
+        return ADJ_OK;
+    }
+    /* 取相邻城；邻接表未就绪时返回空数组（= 不出征） */
+    function adjOf(c) { return adjReady() ? (CITY_ADJ[c] || []) : []; }
+    function isAdjacent(a, b) {
+        if (a === b) return false;
+        var l = adjOf(a), i;
+        for (i = 0; i < l.length; i++) if (l[i] === b) return true;
+        return false;
+    }
+    /* 本月已被打过的目标城：同一座城当月只安排一次进攻。
+       重复进攻会让引擎战斗队列里排两场同一个目标的战斗，战斗画面会叠出两条横幅（双 VS）。 */
+    var ATTACKED = { month: '', targets: {} };
+    function alreadyAttacked(c) {
+        var mk = monthKey();
+        if (ATTACKED.month !== mk) { ATTACKED.month = mk; ATTACKED.targets = {}; }
+        return !!ATTACKED.targets[c];
+    }
+    function markAttacked(c) {
+        var mk = monthKey();
+        if (ATTACKED.month !== mk) { ATTACKED.month = mk; ATTACKED.targets = {}; }
+        ATTACKED.targets[c] = 1;
+    }
 
     function aiOccupyEmptyCities() {
         if (!flag('aiEmptyCity')) return;
@@ -1292,7 +1457,7 @@
                 var city = cities[c];
                 if (city.Belong !== WILD) continue;              /* 只处理无主城 */
                 if (rand(100) >= 50) continue;                   /* 概率性：每城每月 50%，像系统出征的随机手感 */
-                var adj = CITY_ADJ[c] || [];
+                var adj = adjOf(c);
                 var srcCity = -1, srcKing = 0, best = -1, bestArms = 0;
                 for (i = 0; i < adj.length; i++) {
                     var nc = cities[adj[i]];
@@ -1364,7 +1529,7 @@
 
     /* 相邻敌城对本城的威胁 */
     function cityThreat(c, king) {
-        var cities = baye.data.g_Cities, adj = CITY_ADJ[c] || [], i, j, t = 0;
+        var cities = baye.data.g_Cities, adj = adjOf(c), i, j, t = 0;
         for (i = 0; i < adj.length; i++) {
             var nc = cities[adj[i]];
             if (!nc || nc.Belong <= 0 || nc.Belong === CAPTIVE || nc.Belong === king) continue;
@@ -1406,6 +1571,13 @@
     function launchAttack(srcCity, target, team) {
         var idxArr = baye.data.FIGHTERS_IDX, fArr = baye.data.FIGHTERS;
         if (!idxArr || !fArr || !team || !team.length) return false;
+        /* 硬约束：只能打「道路相连的相邻城池」。这张出征单是绕过引擎校验直接写进指令队列的，
+           所以这里必须自己拦一道 —— 否则地图/城名对不上时会出现跨地图进攻。 */
+        if (!isAdjacent(srcCity, target)) {
+            log('拦截跨城进攻：' + cityName(srcCity) + '→' + cityName(target) + '（不相邻）');
+            return false;
+        }
+        if (alreadyAttacked(target)) return false;
         if (team.length > FGT_PLAMAX) team = team.slice(0, FGT_PLAMAX);   /* 超出会被引擎静默丢弃 */
         var batch = -1, i;
         for (i = 0; i < idxArr.length; i++) if (!idxArr[i]) { batch = i; break; }
@@ -1419,6 +1591,7 @@
         var o = q[no];
         o.OrderId = 27; o.Person = batch; o.City = srcCity; o.Object = target;
         o.Arms = 0; o.Food = src ? (src.Food || 0) : 0; o.Money = 0; o.Consume = 213; o.TimeCount = 0;
+        markAttacked(target);
         return true;
     }
 
@@ -1504,7 +1677,7 @@
             var keepC = (c === capital && danger[c] > 0.3) ? 2 : 1;
             if (gl.length <= keepC) continue;               /* 无人可调 */
             /* 挑目标：价值 ÷ 防御 最高，且打得动 */
-            var adj = CITY_ADJ[c] || [], bestT = -1, bestScore = -1;
+            var adj = adjOf(c), bestT = -1, bestScore = -1;
             for (j = 0; j < adj.length; j++) {
                 var tc = adj[j], nc = cities[tc];
                 if (!nc || nc.Belong <= 0 || nc.Belong === CAPTIVE || nc.Belong === king) continue;
@@ -2862,7 +3035,7 @@
         { k: 'searchGen', t: '搜寻必定成功', d: '开启后搜寻当场招到武将（城内在野优先），无视伯乐属性和随机性' },
         { k: 'searchTool', t: '搜寻道具必定成功', d: '开启后搜寻当场发现城中隐藏的道具（不会复制他人道具），优先级在武将搜寻之后' },
         { k: 'noDeathRescue', t: '自动阵亡补救', d: '默认关。开启后每月自动把「上月确实在城、本月消失」的武将按重伤找回；也可以在游戏内「武将修复」里逐个选人找回' },
-        { k: 'kingGuard', t: '君主免疫俘虏', d: '势力仍有城池可退时，君主改为转移+重伤；只剩最后一城时照常被俘（保留灭国代价）' },
+        { k: 'kingGuard', t: '君主免疫俘虏', d: '势力仍有城池可退时，君主改为转移+重伤；只剩最后一城时照常被俘（保留灭国代价）。每月还会做一次城池名册自愈：君主/武将错列或重复在册会自动归位' },
         { k: 'autoBalance', t: 'AI 托管战斗加权结算', d: '武将战力×兵力×城防×战场地形加权，替代原版「只比总兵力」，杜绝一将挡八将' },
         { k: 'noDisaster', t: '城池无灾害', d: '默认关闭（尊重原机制）。开启后每月把己方城池防灾值拉满并清除已有的饥荒/旱灾/水灾/暴动' },
         { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（等级不设上限），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
@@ -2902,6 +3075,8 @@
             + '<br>· <b>态势评估</b>：每座城算「威胁（相邻敌城可投入战力）÷ 守备（守军×城防）」，<b>都城危险度权重加倍</b> —— 老家不会没人管'
             + '<br>· <b>回防调度</b>：危险城从后方安全城抽将补防；每城至少留 1 人（都城受威胁时留 2 人）'
             + '<br>· <b>智能配兵</b>：按守方战力配够就打、配不够就不打，剩下的留守 —— 不再倾巢而出'
+            + '<br>· <b>道路校验</b>：出征单是本脚本自己写进指令队列的（绕过引擎校验），所以出手前会自查'
+            + '<b>道路是否相连</b>，非相邻一律不发动；同一座城当月也只安排一次进攻（避免战斗队列里排两场同一目标的仗）'
             + '<br>· <b>多线作战</b>：多座城可分别出击不同目标，不再「一大队沿路平推」'
             + '<br><b>玩家平等</b>：AI 打玩家与打其他 AI 同门槛，没有新手保护；<b>标准</b>=需 35% 战力优势才动手，<b>强势</b>=15%，更频繁开战。'
             + '控制台 <code>bayeCheat.api.strategy()</code> 可查看各势力态势。</div>'

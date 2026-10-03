@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.11.5';
+    var CHEAT_VERSION = '1.11.6';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -982,7 +982,7 @@
                 if (!atkKing0) atkKing0 = cityName(fp.CityIndex) + '来军';
                 var defKing0 = safeName(cityAt(fp.CityIndex) && cityAt(fp.CityIndex).Belong) || cityName(fp.CityIndex);
                 if (!defKing0) defKing0 = cityName(fp.CityIndex) || '守方';
-                pushReport('【战】' + atkKing0 + '军 进攻 ' + cityName(fp.CityIndex)
+                pushReport('【战】' + atkKing0 + '军 ' + attackSrcTag(fp) + '进攻 ' + cityName(fp.CityIndex)
                     + '（' + defKing0 + '军），' + (win ? '城破' : '击退') + oddAttackTag(fp));
             } catch (e) { log('托管战报异常', e); }
 
@@ -1061,7 +1061,7 @@
                 var res = baye.data.g_FgtOver === FGT_WON ? '城破' : '击退';
                 battleRosters.push({ city: fp.CityIndex, pids: pids, month: monthKey(), result: baye.data.g_FgtOver });
                 /* 战斗当场就写月报，每场都记（不等月末，避免一个月只留最后一场） */
-                pushReport('【战】' + atkKing + '军 进攻 ' + cityName(fp.CityIndex)
+                pushReport('【战】' + atkKing + '军 ' + attackSrcTag(fp, atkPid) + '进攻 ' + cityName(fp.CityIndex)
                     + '（' + defKing + '军），' + res + oddAttackTag(fp, atkPid));
             }
         } catch (e) { log('战斗记录异常', e); }
@@ -1497,34 +1497,46 @@
         for (i = 0; i < l.length; i++) if (l[i] === b) return true;
         return false;
     }
-    /* 本月已被打过的目标城：同一座城当月只安排一次进攻。
-       重复进攻会让引擎战斗队列里排两场同一个目标的战斗，战斗画面会叠出两条横幅（双 VS）。 */
+    /* 本月是否已有部队「正压着」这座城（v1.11.6：用户要求一个城市一个月内可被多次攻击，
+       所以不再限制「本月打了几次」——只拦同时排两支部队打同一城，
+       那种情况战斗画面会叠出两条横幅）。 */
     var ATTACKED = { month: '', targets: {} };
     function alreadyAttacked(c) {
         var mk = monthKey();
         if (ATTACKED.month !== mk) { ATTACKED.month = mk; ATTACKED.targets = {}; }
-        if (ATTACKED.targets[c]) return true;
-        /* 引擎自己的指令队列里若已有攻这座城的单（我们和原版AI 都可能排上），
-           就不再排第二场 —— 同一座城同月排两场，战斗画面会叠出两条横幅 */
+        /* 引擎指令队列里若已有攻这座城的单（我们或原版 AI 排的），
+           说明这支部队还没打完，此时不再排第二支 */
         try {
             var q = baye.data.g_OrderQueue, i;
             for (i = 0; i < q.length; i++) {
                 if (q[i] && q[i].OrderId === 27 && q[i].Object === c) return true;
             }
         } catch (e) { }
-        /* 本月已经打过这座城（引擎已结算过） */
-        try {
-            var mk2 = monthKey(), b;
-            for (b = 0; b < battleRosters.length; b++) {
-                if (battleRosters[b].city === c && battleRosters[b].month === mk2) return true;
-            }
-        } catch (e2) { }
         return false;
     }
     function markAttacked(c) {
         var mk = monthKey();
         if (ATTACKED.month !== mk) { ATTACKED.month = mk; ATTACKED.targets = {}; }
-        ATTACKED.targets[c] = 1;
+        ATTACKED.targets[c] = (ATTACKED.targets[c] || 0) + 1;   /* 仅作台账统计 */
+    }
+    /* 最近一次进攻「目标城 → 出发城」台账：写出征单时记下，月报战报里回显「自 XX 进攻」 */
+    var ATTACK_SRC = {};
+    function noteAttackSrc(target, srcCity) {
+        ATTACK_SRC[target] = { city: srcCity, month: monthKey() };
+    }
+    /* 战报里的「自 X 进攻」：优先用我们写单时记下的出发城，
+       引擎自己发起的进攻则退而用攻方主帅当前所在城。 */
+    function attackSrcTag(fp, atkPid) {
+        try {
+            if (!fp) return '';
+            var rec = ATTACK_SRC[fp.CityIndex];
+            if (rec && rec.month === monthKey()) return '自 ' + cityName(rec.city) + ' ';
+            var pid = (atkPid !== undefined && atkPid >= 0) ? atkPid : (fp.GenArray[0] ? fp.GenArray[0] - 1 : -1);
+            if (pid < 0) return '';
+            var from = cityOfPerson(pid);
+            if (from === 0xff) return '';
+            return '自 ' + cityName(from) + ' ';
+        } catch (e) { return ''; }
     }
 
     function aiOccupyEmptyCities() {
@@ -1672,6 +1684,7 @@
         o.OrderId = 27; o.Person = batch; o.City = srcCity; o.Object = target;
         o.Arms = 0; o.Food = src ? (src.Food || 0) : 0; o.Money = 0; o.Consume = 213; o.TimeCount = 0;
         markAttacked(target);
+        noteAttackSrc(target, srcCity);
         return true;
     }
 
@@ -1854,8 +1867,10 @@
         return undefined;
     }
 
-    /* 新开局 / 读档：清空一切跨局状态（月报、阵亡台账、跟踪基线、快照、战斗名单） */
-    function resetRunState() {
+    /* 新开局 / 读档：清空一切跨局状态（月报、阵亡台账、跟踪基线、快照、战斗名单）
+       isNewGame=true 时额外清掉强化等级 —— 强化键是「武将下标_槽位」，新档的槽位上
+       是完全不同的武将/道具，留着就是上一档的脏数据（用户反馈：新档残留上个档强化/阵亡）。 */
+    function resetRunState(isNewGame) {
         info.monthReport.length = 0;
         deaths.length = 0;
         try { localStorage.removeItem(DEATHS_KEY); } catch (e) { }
@@ -1866,17 +1881,25 @@
         appliedOnce = false;
         diag.fightCountWinner = 0; diag.exitBattle = 0;
         diag.autoBattlesRecorded = 0; diag.applyDeathRate = 0; diag.deathsApplied = 0;
-        /* 强化等级是玩家长期投入，不像战死台账那样随新局清空；
-           但槽位键是「武将下标_槽位」，换档后同一位置的道具可能完全不同，
-           所以只在新开局时校验一次：槽位上的道具名与记录不符就丢弃该记录。 */
-        forgeValidate();
-        PENDING_PLACE = {};            /* 新开局：清空「待归位君主」 */
+        if (isNewGame) {
+            /* 新档：强化记录整表清掉（新档的「武将下标_槽位」与上一档无关） */
+            var fc = 0;
+            for (var fk in FORGE) { if (FORGE.hasOwnProperty(fk)) { fc++; } }
+            FORGE = {};
+            saveForge();
+            if (fc) log('新开局：已清空上一档的强化记录 ' + fc + ' 条');
+        } else {
+            /* 读档：强化是长期投入，只校验槽位道具名是否还对得上（换档后自动丢弃失效记录） */
+            forgeValidate();
+        }
+        PENDING_PLACE = {};            /* 待归位君主 */
         ATTACKED.month = ''; ATTACKED.targets = {};
-        log('已重置本局运行数据（月报/台账/跟踪基线）');
+        ATTACK_SRC = {};                /* 进攻出发城台账 */
+        log('已重置本局运行数据（月报/台账/跟踪基线' + (isNewGame ? '，强化记录已清空' : '') + '）');
     }
 
     function onDidOpenNewGame() {
-        resetRunState();
+        resetRunState(true);
         return undefined;
     }
 

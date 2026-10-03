@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.11.0';
+    var CHEAT_VERSION = '1.11.1';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -173,7 +173,7 @@
         forgeGuarantee: 0,   // 强化必定成功：成功率强制 100%（测试/刷满级用，费用照收）
         forgeMount: 0,       // 允许强化纯坐骑：默认关（纯坐骑只加移动、不加伤害，强化收益为0）
         richMode: 0,          // 一夜暴富：每月给君主所在城塞一笔钱（配合引擎经济，量级见 richAmount）
-        richAmount: 3000,     // 一夜暴富每月注入的钱（单城上限 6000，超出会被引擎截断）
+        richAmount: 3000,     // 一夜暴富每月注入的钱（单城上限 30000）
         allTools: 0,          // 获取全部道具：每月把全道具表塞进君主所在城
         levelBoost: 0,        // 武将等级提升：每月给己方武将加经验（全员涨级）
         levelBoostAll: 0,     // 全员满级：开局/读档时把己方武将直接拉到等级上限
@@ -320,24 +320,30 @@
     var MENU_MAX_HALF = 30;
 
     function fitMenuLines(items) {
-        var out = [];
+        var out = [], map = [];
         for (var i = 0; i < items.length; i++) {
             var w = 0, cur = '';
-            var s = gbkSafe(items[i]);
+            var s = gbkSafe(items[i] == null ? '' : String(items[i]));
             for (var j = 0; j < s.length; j++) {
                 var cw = s.charCodeAt(j) > 255 ? 2 : 1;
-                if (w + cw > MENU_MAX_HALF) { out.push(cur); cur = ''; w = 0; }
+                if (w + cw > MENU_MAX_HALF) { out.push(cur); map.push(i); cur = ''; w = 0; }
                 cur += s[j]; w += cw;
             }
             out.push(cur);
+            map.push(i);          /* 每条折行都记住它属于哪个原始条目 */
         }
-        return out;
+        return { lines: out, map: map };
     }
 
-    /* 全屏列表（居中）：宽高用引擎实际分辨率推导，别再用 225x135 这种超屏值 */
+    /* 全屏列表（居中）：宽高用引擎实际分辨率推导，别再用 225x135 这种超屏值。
+       回调索引映射回原始条目：长行折行后列表会变长，若不映射，
+       点「花钱强化？」「再强化一次？」这类按索引判断的按钮就会错位失效。 */
     function menu(items, init, cb) {
-        var w = SW() - 8, h = SH() - 8;
-        baye.centerChoose(w, h, fitMenuLines(items), init || 0, cb);
+        var fit = fitMenuLines(items);
+        baye.centerChoose(SW() - 8, SH() - 8, fit.lines, init || 0, function (ind) {
+            if (ind === baye.None || ind === 65535 || ind === undefined) { cb(ind); return; }
+            cb(fit.map[ind] === undefined ? ind : fit.map[ind]);
+        });
     }
     /* 左侧详情 + 右侧城池列表（列表 30px 宽，贴右缘） */
     function listView(x, y, w, h, items, init, cb) {
@@ -1724,7 +1730,7 @@
             baye.clearRect(0, 0, w, h);
             baye.drawRect(0, 0, w, h);
             baye.drawRect(2, 2, w - 3, h - 3);
-            var lines = kind === 'power' ? cityPowerLines(index) : cityToolLines(index);
+            var lines = kind === 'power' ? cityPowerLines(index, innerHalf) : cityToolLines(index);
             var y = pad2, k, j;
             for (k = 0; k < lines.length && y < h - 6; k++) {
                 var wrapped = wrapLines(lines[k], innerHalf);
@@ -1762,13 +1768,14 @@
         });
     }
 
-    /* 名单太长会占掉整个详情区，先掐头（最多展示 6 个 + 等N人） */
-    function briefList(arr, keep) {
-        if (arr.length <= keep) return arr.join('、');
-        return arr.slice(0, keep).join('、') + ' 等共' + arr.length + '人';
+    /* 名单完整列出（v1.11.1：不要「等共N人」，全部姓名列出，超宽自动折行） */
+    function briefList(arr) {
+        return arr.join('、');
     }
 
-    function cityPowerLines(c) {
+    /* maxHalf：详情区每行可容纳的半角数（由调用方按分辨率传入，默认菜单宽 30） */
+    function cityPowerLines(c, maxHalf) {
+        var W = maxHalf || MENU_MAX_HALF;
         var city = cityAt(c);
         var out = ['【' + cityName(c) + '】'];
         out.push('君主:' + safeName(city.Belong) + ' 太守:' + safeName(city.SatrapId));
@@ -1781,9 +1788,9 @@
             else if (p.Belong === WILD) { if (p.Level > 0 && !(p.Force === 150 && p.IQ === 150)) wild.push(nameOf(list[i])); }
             else gen.push(nameOf(list[i]));
         }
-        out.push('武将' + gen.length + ':' + briefList(gen, 6));
-        out.push('俘虏' + pris.length + ':' + briefList(pris, 4));
-        out.push('在野' + wild.length + ':' + briefList(wild, 4));
+        out = out.concat(wrapLines('武将' + gen.length + ':' + briefList(gen), W));
+        out = out.concat(wrapLines('俘虏' + pris.length + ':' + briefList(pris), W));
+        out = out.concat(wrapLines('在野' + wild.length + ':' + briefList(wild), W));
         out.push('粮:' + city.Food + ' 钱:' + city.Money);
         out.push('后备兵:' + city.MothballArms);
         return out;
@@ -2083,7 +2090,7 @@
        因为费用按1.3 次幂增长，到 +100 已经是天文数字，曲线本身就把等级锁死在 +15~20 区间。
        伤害系数走饱和曲线（见 forgeDmgMul），高等级自动收敛到上限，不会无限膨胀。 */
     var FORGE_MAX = 999;
-    /* 费用基准：对齐引擎真实经济 —— 城市金币硬上限 6000（Money>6000 截断），
+    /* 费用基准：对齐引擎真实经济 —— 城市金币上限 30000（Money>30000 截断），
        月自动收入 = Commerce×0.05（单城约 10 金，全势力 100~300 金）。
        基准 30 + 1.3 次幂（稀有度 2 的普通兵器）：
          单次 60 → 1684 金，单次始终在单城上限内；
@@ -2384,7 +2391,7 @@
                     var nm = '';
                     try { nm = gbkSafe(baye.getToolName(tid1 - 1)) || ''; } catch (e2) { }
                     if (nm && ctx.value === nm) {          /* 原版填的就是这件装备 */
-                        ctx.value = ctx.value + ' +' + lv;
+                        ctx.value = '+' + lv + ctx.value;   /* 前置显示：+8狂歌戟 */
                         break;
                     }
                 }
@@ -2429,6 +2436,7 @@
             if (p.Belong !== myKing) continue;
             for (var s = 0; s < 2; s++) {
                 if (!p.Equip[s]) continue;
+                if (!toolForgeable(p.Equip[s] - 1)) continue;   /* 消耗品/无属性/纯坐骑（未开开关）不算可强化 */
                 n++;
             }
         }
@@ -2555,32 +2563,29 @@
         var cap = capitalCity();
         var capName = cap >= 0 ? cityName(cap) : '（无城）';
         var capMoney = cap >= 0 ? (cityAt(cap).Money || 0) : 0;
-        menu([
+        var lines = [
             '资源管理',
             '',
             '都城 ' + capName + '　金币 ' + capMoney + '/' + MONEY_SOFT_CAP,
             '己方武将 ' + ids.length + ' 名　等级上限 ' + MAX,
-            '',
-            '【1】立即加钱（君主所在城）',
-            '【2】全员加经验 +30',
-            '【3】全员加经验 +100',
-            '【4】一键满级（全员 ' + MAX + ' 级）',
-            '【5】获取全部道具（一次性）',
-            '',
-            '每月自动：' + (flag('richMode') ? '加钱 ' : '关')
-                + ' / ' + (flag('allTools') ? '道具' : '关')
-                + ' / ' + (flag('levelBoost') ? '经验' : '关'),
-            '长期开关：' + (flag('levelBoostAll') ? '读档即满级' : '关')
-        ], 0, function (ind) {
+            ''
+        ];
+        /* 动作按真实行号登记：菜单前有 5 行表头，若硬编码 1~5 会全部错位失效（v1.11.1 修复） */
+        var acts = {};
+        function addAct(label, fn) { acts[lines.length] = fn; lines.push(label); }
+        addAct('【1】立即加钱（君主所在城）', function () { doRich(false, true); });
+        addAct('【2】全员加经验 +30', function () { boostExperience(30, false, false); });
+        addAct('【3】全员加经验 +100', function () { boostExperience(100, false, false); });
+        addAct('【4】一键满级（全员 ' + MAX + ' 级）', function () { levelUpAll(false, false); });
+        addAct('【5】获取全部道具（一次性）', function () { giveAllTools(false); });
+        lines.push('');
+        lines.push('每月自动：' + (flag('richMode') ? '加钱 ' : '关')
+            + ' / ' + (flag('allTools') ? '道具' : '关')
+            + ' / ' + (flag('levelBoost') ? '经验' : '关'));
+        lines.push('长期开关：' + (flag('levelBoostAll') ? '读档即满级' : '关'));
+        menu(lines, 0, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) return;
             /* 这五个函数内部已自带 alert（silent=false），不要再叠加一次弹窗。 */
-            var acts = {
-                1: function () { doRich(false); },
-                2: function () { boostExperience(30, false, false); },
-                3: function () { boostExperience(100, false, false); },
-                4: function () { levelUpAll(false, false); },
-                5: function () { giveAllTools(false); }
-            };
             if (!acts[ind]) { showResourceMenu(); return; }
             acts[ind]();
             /* 引擎的 alert / 菜单都是异步 UI：延时一帧再回菜单，避免与提示框抢占 */
@@ -2599,9 +2604,7 @@
        三个功能都基于引擎已核实的事实：
 
        1) 一夜暴富：city.Money 是城池字段，引擎会「月入 = Commerce×0.05」缓慢积累，
-          但有硬上限（Money > 6000 直接截断，> 2500 打 0.7 折）。
-          所以给钱必须「控制在上限内」才有意义 —— 一次给 6000+ 是浪费，
-          默认给 3000（刚好让玩家能立刻买商店里的 3000 金道具）。
+          上限 30000（原版机制，Money>30000 截断）。
           钱加在<b>君主所在城</b>，因为引擎指令与商店都从都城支取。
 
        2) 等级提升：Person.Experience 是 0~100 的经验进度条，
@@ -2627,11 +2630,11 @@
         return -1;
     }
 
-    /* 引擎金币上限：Money>6000 截断、>2500 打折。给再多也是浪费，所以按上限夹紧。 */
-    var MONEY_SOFT_CAP = 6000;
+    /* 引擎金币上限：原版机制 Money>30000 截断，按上限夹紧。 */
+    var MONEY_SOFT_CAP = 30000;
 
-    function doRich(silent) {
-        if (!flag('richMode')) return 0;
+    function doRich(silent, force) {
+        if (!flag('richMode') && !force) return 0;   /* 资源管理菜单手动点击时 force=true，不依赖月度开关 */
         var c = capitalCity();
         if (c < 0) { if (!silent) alert2('没有己方城池，无法增加金钱'); return 0; }
         var city = cityAt(c);
@@ -2813,13 +2816,17 @@
     /* ======================== 8. 设置面板（HTML 悬浮层） ======================== */
 
     var UI_CSS = [
-        '#bayeCheatDock{position:fixed;top:8px;right:8px;z-index:2147483000;font:13px/1.6 -apple-system,"PingFang SC",sans-serif}',
+        /* 默认锚在右下角（v1.11.1）：图标可拖动，拖动后按拖动位置记忆 */
+        '#bayeCheatDock{position:fixed;right:10px;bottom:12px;z-index:2147483000;font:13px/1.6 -apple-system,"PingFang SC",sans-serif}',
         '#bayeCheatDock button{font:inherit}',
-        '#bayeCheatDock .bd{width:22px;height:22px;border-radius:50%;border:1px solid rgba(0,0,0,.15);background:#fff;color:#333;',
-        '  box-shadow:0 1px 4px rgba(0,0,0,.25);cursor:pointer;padding:0;line-height:1;opacity:.55}',
+        '#bayeCheatDock .bd{width:34px;height:34px;border-radius:50%;border:1px solid rgba(0,0,0,.15);background:#fff;color:#333;font-size:19px;',
+        '  box-shadow:0 1px 4px rgba(0,0,0,.25);cursor:pointer;padding:0;line-height:32px;opacity:.55}',
         '#bayeCheatDock .bd:hover{opacity:1}',
-        '#bayeCheatDock .panel{display:none;width:min(330px,92vw);max-height:78vh;overflow-y:auto;margin-top:6px;background:#fff;',
+        /* 面板绝对定位在图标上方（右下角默认向上弹，不占屏幕外）；靠上拖动时加 .down 向下弹 */
+        '#bayeCheatDock .panel{display:none;position:absolute;bottom:calc(100% + 10px);right:0;width:min(330px,92vw);max-height:min(440px,72vh);overflow-y:auto;',
+        '  -webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y;background:#fff;',
         '  border-radius:12px;box-shadow:0 6px 26px rgba(0,0,0,.25);padding:10px 12px 14px;color:#1f1f1f}',
+        '#bayeCheatDock .panel.down{bottom:auto;top:calc(100% + 10px)}',
         '#bayeCheatDock.on .panel{display:block}',
         '#bayeCheatDock h4{margin:10px 0 6px;font-size:12px;font-weight:600;color:#7a7a7a;letter-spacing:.5px}',
         '#bayeCheatDock h4:first-child{margin-top:2px}',
@@ -2858,10 +2865,10 @@
         { k: 'kingGuard', t: '君主免疫俘虏', d: '势力仍有城池可退时，君主改为转移+重伤；只剩最后一城时照常被俘（保留灭国代价）' },
         { k: 'autoBalance', t: 'AI 托管战斗加权结算', d: '武将战力×兵力×城防×战场地形加权，替代原版「只比总兵力」，杜绝一将挡八将' },
         { k: 'noDisaster', t: '城池无灾害', d: '默认关闭（尊重原机制）。开启后每月把己方城池防灾值拉满并清除已有的饥荒/旱灾/水灾/暴动' },
-        { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（上限 +13），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
+        { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（等级不设上限），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
         { k: 'forgePity', t: '强化保底', d: '默认开启。连续失败 5 次后下一次必定成功，避免高等级陷入无限掉级（+11 以上成功率仅 18%~9%）' },
-        { k: 'richMode', t: '一夜暴富', d: '每月给君主所在城加一笔钱。引擎金币有硬上限（单城 6000，超过直接截断），默认加 3000 —— 刚好够立刻买商店里 3000 金的道具' },
-        { k: 'richAmount', t: '暴富金额', d: '一夜暴富每月注入的钱数。引擎会截断超过 6000 的部分，设再高也没用' },
+        { k: 'richMode', t: '一夜暴富', d: '每月给君主所在城加一笔钱。引擎金币上限（单城 30000），默认加 3000 —— 刚好够立刻买商店里 3000 金的道具' },
+        { k: 'richAmount', t: '暴富金额', d: '一夜暴富每月注入的钱数。引擎会截断超过 30000 的部分' },
         { k: 'allTools', t: '获取全部道具', d: '每月把道具表里所有「真实存在的道具」（已按名字过滤空槽位）投放到君主所在城。想一次性给全请用游戏内「资源管理」' },
         { k: 'levelBoost', t: '武将等级提升', d: '每月给全部己方武将 +30 经验（引擎经验条满 100 即升 1 级，等级上限由引擎 maxLevel 决定，默认 30）' },
         { k: 'levelBoostAll', t: '全员满级（读档即生效）', d: '默认关。开启后每次读档 / 新开局，自动把全部己方武将直接拉到等级上限。也可在游戏内「资源管理」手动一键满级' },
@@ -2872,7 +2879,7 @@
         { k: 'verbose', t: '控制台详细日志', d: '输出每次结算的战力对比、水域占比与胜率，便于调权重' }
     ];
 
-    var DOCK_POS_KEY = 'baye_cheat_dock_pos_v1';
+    var DOCK_POS_KEY = 'baye_cheat_dock_pos_v2';   /* v2：默认改右下角，丢弃旧版右上角记忆 */
 
     function buildUI() {
         if (document.getElementById('bayeCheatDock')) return;
@@ -2903,7 +2910,7 @@
             + '</div><div class="tip" style="text-align:left">当前：<b id="bayeCheatWfNow"></b>。决定 AI 每月主动出击的总量与激进程度：原版=保守（约 4 次/月，需 35% 优势）、较多=正常（约 7 次，需 20%）、频繁=活跃（约 10 次，势均力敌也敢打）。<b>智慧引擎关闭时本项不生效</b>（完全原版机制）。</div>'
             + '<h4>铁匠铺（装备强化）</h4>'
             + '<div class="tip" style="text-align:left">游戏内按 <b>H</b> →「铁匠铺」进入：选武将 → 选装备槽 → 确认花钱。'
-            + '上限 <b>+13</b>，费用 <code>30×稀有度×(等级+1)^1.3</code>（指数上涨，末次约 1684 金），成功率 '
+            + '等级<b>不设上限</b>，费用 <code>30×稀有度×(等级+1)^1.3</code>（指数上涨），成功率 '
             + '<code>100/100/95/90/82/70/60/50/40/32/24/18/13/9</code>。<br>'
             + '<b>失败 -1 级</b>；但 <b>+' + FORGE_SAFE_LV + ' 起进入高阶保护</b>（失败只损钱不降级，DNF 强化保护券的简化版）——'
             + '否则低成功率叠掉落级会变成随机游走，实测期望花费高达 597 万金，等于永远打不到 +13。<br>'
@@ -2917,7 +2924,7 @@
             + '<h4>资源管理</h4>'
             + '<div class="tip" style="text-align:left">游戏内按 <b>H</b> →「<b>资源管理</b>」：立即加钱、全员加经验（+30 / +100）、'
             + '一键满级、获取全部道具。「获取全部道具」只投放<b>真实存在的道具</b>（按名字过滤掉空槽位），'
-            + '一次性给全，不会把存档塞爆。注意引擎金币硬上限 <b>6000/城</b>，超过会被直接截断。</div>'
+            + '一次性给全，不会把存档塞爆。注意引擎金币上限 <b>30000/城</b>，超过会被直接截断。</div>'
             + '<h4>战死调节</h4><div class="fn" id="bayeCheatDr">'
             + drBtn(0, '禁止') + drBtn(1, '原版×1') + drBtn(5, '×5') + drBtn(20, '×20') + drBtn(50, '×50')
             + '</div>'
@@ -2961,8 +2968,8 @@
                 var dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
                 if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 5) return;
                 drag.moved = true;
-                var x = Math.max(2, Math.min(window.innerWidth - 30, drag.left + dx));
-                var y = Math.max(2, Math.min(window.innerHeight - 30, drag.top + dy));
+                var x = Math.max(2, Math.min(window.innerWidth - 36, drag.left + dx));
+                var y = Math.max(2, Math.min(window.innerHeight - 36, drag.top + dy));
                 wrap.style.left = x + 'px';
                 wrap.style.top = y + 'px';
                 wrap.style.right = 'auto';
@@ -2972,7 +2979,10 @@
                 var wasDrag = drag && drag.moved;
                 drag = null;
                 if (wasDrag) saveDockPos(wrap);
-                else wrap.classList.toggle('on');          /* 没拖动 → 当点击 */
+                else {
+                    wrap.classList.toggle('on');          /* 没拖动 → 当点击 */
+                    if (wrap.classList.contains('on')) placePanel();
+                }
             });
         }
 
@@ -2982,6 +2992,28 @@
             if (wrap.contains(e.target)) return;
             wrap.classList.remove('on');
         }, true);
+
+        /* —— 面板内触摸事件不再冒泡到 document（v1.11.1 修复滚动卡顿）：
+           引擎在 document 上挂了 touch 处理，滚动设置面板时会被引擎逻辑吃掉，
+           表现为滑动好几秒没反应。拦在面板层 + touch-action 交给原生滚动。 —— */
+        ['touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach(function (ev) {
+            wrap.addEventListener(ev, function (e) { e.stopPropagation(); }, { passive: true });
+        });
+
+        /* —— 面板打开时按图标位置决定向上/向下弹，并收进屏幕内 —— */
+        function placePanel() {
+            var panel = wrap.querySelector('.panel');
+            if (!panel) return;
+            var r = wrap.getBoundingClientRect();
+            var vh = window.innerHeight || screen.height;
+            /* 默认右下角图标 → 向上弹；图标拖到上半屏 → 向下弹 */
+            panel.classList.toggle('down', r.top <= vh * 0.5);
+            panel.style.left = '';
+            panel.style.right = '';
+            var pr = panel.getBoundingClientRect();
+            if (pr.left < 2) { panel.style.left = '0px'; panel.style.right = 'auto'; }   /* 靠左拖过：面板右缘对齐会左溢出 */
+            if (pr.right > (window.innerWidth || screen.width) - 2) { panel.style.right = '0px'; panel.style.left = 'auto'; }
+        }
 
         each(wrap.querySelectorAll('.sw'), function (b) {
             b.onclick = function () {

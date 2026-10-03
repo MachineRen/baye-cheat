@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.11.6';
+    var CHEAT_VERSION = '1.11.7';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -135,6 +135,12 @@
                 adjOf: adjOf,
                 launchAttack: launchAttack,
                 repairRoster: repairCityRoster,
+                /* v1.11.7：存档分槽（强化/阵亡跟随存档，三个档位分开；新档未保存用 tmp） */
+                slot: currentSlot,
+                setSlot: setSlot,
+                saveKeys: storageSaveKeys,
+                moneyCap: function () { return MONEY_SOFT_CAP; },
+                probeMoneyCap: probeMoneyCap,
                 /* 换月/读档时清空「本月已打过」账本；控制台与测试也用它复位 */
                 resetAttackLog: function () { ATTACKED.month = ''; ATTACKED.targets = {}; return true; },
                 showMonthReport: showMonthReport,
@@ -161,9 +167,100 @@
         console.log.apply(console, a);
     }
 
+    /* ---------- 存档分槽（v1.11.7） ----------
+       强化等级、阵亡台账属于「存档内」数据，必须跟着存档走：三个存档位分开保存，
+       新开的档在保存之前落在 'tmp' 临时槽；之后读档若能识别出真实档位，会把临时槽数据并过去。
+       档位识别：引擎字段（g_SaveSlot 之类）→ URL 参数（?slot=2）→ 面板手动指定；
+       都拿不到就用 'tmp'，并在控制台打印候选存档键，便于进一步确认。 */
+    var SLOT_KEY = 'baye_cheat_slot_v1';         /* 面板选择：auto / tmp / 1 / 2 / 3 */
+    var SLOT_MARK = 'baye_cheat_last_slot_v1';  /* 上次实际使用的槽（用于 tmp→档位 迁移） */
+    function autoSlotId() {
+        try {
+            var d = baye.data, ks = ['g_SaveSlot', 'g_SaveIndex', 'g_SaveNo', 'g_SaveID', 'g_SlotIndex'], i, v, n;
+            for (i = 0; i < ks.length; i++) {
+                v = d[ks[i]];
+                if (v !== undefined && v !== null && v !== '' && isFinite(Number(v))) {
+                    n = Number(v);
+                    return 'slot' + (n > 0 ? n : 1);
+                }
+            }
+            var m = /[?&](?:slot|save|s)=([0-9]+)/i.exec(String((window.location && window.location.search) || ''));
+            if (m) return 'slot' + m[1];
+        } catch (e) { }
+        return '';
+    }
+    function currentSlot() {
+        var sel = 'auto';
+        try { sel = localStorage.getItem(SLOT_KEY) || 'auto'; } catch (e) { }
+        if (sel === 'tmp') return 'tmp';
+        if (sel === '1' || sel === '2' || sel === '3') return 'slot' + sel;
+        return autoSlotId() || 'tmp';
+    }
+    function skey(name) { return 'baye_cheat_' + currentSlot() + '_' + name; }
+    /* 旧版无槽前缀的键：首次按当前槽落一份，避免历史强化等级/台账丢失 */
+    function migrateLegacy(name, legacyKey) {
+        try {
+            if (localStorage.getItem(skey(name)) !== null) return;
+            var old = localStorage.getItem(legacyKey);
+            if (old !== null && old !== undefined) localStorage.setItem(skey(name), old);
+        } catch (e) { }
+    }
+    function setSlot(sel) {
+        try { localStorage.setItem(SLOT_KEY, sel); } catch (e) { }
+        /* 手动切槽不做 tmp 迁移（手动就是明确指定，不该搬数据） */
+        loadSlotData(false);
+        return currentSlot();
+    }
+    /* 读取（或切换到）当前槽的数据：强化表 + 阵亡台账 */
+    function loadSlotData(migrateTmp) {
+        var cur = currentSlot();
+        /* 新档期落在 tmp，之后「自动」识别到真实档位 → 把临时数据并过去（只做一次）。
+           手动指定槽位时不迁移。 */
+        if (migrateTmp && slotSelection() === 'auto') {
+            var prev = '';
+            try { prev = localStorage.getItem(SLOT_MARK) || ''; } catch (e) { }
+            /* 新档期落在 tmp，之后识别到真实档位 → 把临时数据并过去（只做一次） */
+            if (prev === 'tmp' && cur !== 'tmp') {
+                try {
+                    ['forge_v1', 'deaths_v1'].forEach(function (n) {
+                        var tk = 'baye_cheat_tmp_' + n;
+                        var raw = localStorage.getItem(tk);
+                        if (raw === null) return;
+                        if (localStorage.getItem('baye_cheat_' + cur + '_' + n) === null) {
+                            localStorage.setItem('baye_cheat_' + cur + '_' + n, raw);
+                        }
+                        localStorage.removeItem(tk);
+                    });
+                    log('存档位迁移：tmp → ' + cur);
+                } catch (e2) { }
+            }
+        }
+        migrateLegacy('forge_v1', 'baye_cheat_forge_v1');
+        migrateLegacy('deaths_v1', 'baye_cheat_deaths_v1');
+        try { localStorage.setItem(SLOT_MARK, cur); } catch (e3) { }
+        try { reloadForge(); } catch (e4) { }
+        try {
+            deaths = JSON.parse(localStorage.getItem(skey('deaths_v1')) || '[]') || [];
+        } catch (e5) { deaths = []; }
+    }
+    /* 存档键候选（诊断用）：引擎把存档放在哪、叫什么名字 */
+    function storageSaveKeys() {
+        var out = [], i, k, v;
+        try {
+            for (i = 0; i < localStorage.length; i++) {
+                k = localStorage.key(i);
+                if (!k || k.indexOf('baye_cheat_') === 0) continue;
+                v = localStorage.getItem(k) || '';
+                if (/save|slot|存档|进度/i.test(k) || (v.length > 2000 && /^\s*[{[]/.test(v))) {
+                    out.push(k + '(' + Math.round(v.length / 1024) + 'KB)');
+                }
+            }
+        } catch (e) { }
+        return out;
+    }
+
     /* ======================== 2. 配置（持久化） ======================== */
     var CFG_KEY = 'baye_cheat_cfg_v6';      /* v6：禁止战死改造为「战死概率倍率」 */
-
     var DEFAULT_CFG = {
         /* —— 截图 IMG_6451 的三个开关 —— */
         surrender: 0,        // 招降/招揽必定成功（过强，默认关，面板里自行打开）
@@ -184,7 +281,8 @@
         forgeGuarantee: 0,   // 强化必定成功：成功率强制 100%（测试/刷满级用，费用照收）
         forgeMount: 0,       // 允许强化纯坐骑：默认关（纯坐骑只加移动、不加伤害，强化收益为0）
         richMode: 0,          // 一夜暴富：每月给君主所在城塞一笔钱（配合引擎经济，量级见 richAmount）
-        richAmount: 3000,     // 一夜暴富每月注入的钱（单城上限 30000）
+        richAmount: 3000,     // 一夜暴富每月注入的钱（单城上限由引擎决定，可用 moneyCap 覆盖）
+        moneyCap: 0,          // 0 = 自动（写后回读校准 / 面板探测）；>0 = 手动指定单城金币上限
         allTools: 0,          // 获取全部道具：每月把全道具表塞进君主所在城
         levelBoost: 0,        // 武将等级提升：每月给己方武将加经验（全员涨级）
         levelBoostAll: 0,     // 全员满级：开局/读档时把己方武将直接拉到等级上限
@@ -283,6 +381,7 @@
     /* 安全放置：先从所有在城位置移除，再放进目标城。
        引擎的 AddPerson 默认不去重（checkRedundantOnAddPerson 可开），重复入城会把武将搞丢。 */
     function placePerson(city, idx) {
+        clearPlanCache();                          /* 人员位置变了，战略缓存立即失效 */
         var guard = 0;
         while (guard++ < 45) {
             var cur = cityOfPerson(idx);
@@ -386,6 +485,22 @@
         var r = s.slice(0, c);
         while (l < n) { r += ' '; l += 1; }
         return r;
+    }
+
+    /* 名单打包：按显示宽度（半角=1）把多个名字塞进一行，超出自动换行。
+       引擎对菜单是逐行渲染的，君主多时「一人一行」会卡到没反应。 */
+    function packNames(arr, maxHalf) {
+        var out = [], cur = '', w = 0, i, s, cw;
+        for (i = 0; i < arr.length; i++) {
+            s = String(arr[i]);
+            var need = 0, j;
+            for (j = 0; j < s.length; j++) need += (s.charCodeAt(j) > 255 ? 2 : 1);
+            if (cur && w + need + 2 > maxHalf) { out.push(cur); cur = ''; w = 0; }
+            if (!cur) { cur = s; w = need; continue; }
+            cur += '、' + s; w += need + 2;
+        }
+        if (cur) out.push(cur);
+        return out;
     }
 
     /* ======================== 4. 钩子挂载框架 ======================== */
@@ -1186,15 +1301,15 @@
     }
 
     /* 阵亡台账（持久化）：姓名 / 归属君主 / 时间 / 地点 */
-    var DEATHS_KEY = 'baye_cheat_deaths_v1';
+    var DEATHS_KEY = 'baye_cheat_deaths_v1';   /* 旧键（仅用于一次性迁移） */
     var deaths = (function () {
-        try { return JSON.parse(localStorage.getItem(DEATHS_KEY)) || []; } catch (e) { return []; }
+        try { return JSON.parse(localStorage.getItem(skey('deaths_v1'))) || []; } catch (e) { return []; }
     })();
 
     function saveDeaths() {
         try {
             while (deaths.length > 200) deaths.shift();
-            localStorage.setItem(DEATHS_KEY, JSON.stringify(deaths));
+            localStorage.setItem(skey('deaths_v1'), JSON.stringify(deaths));
         } catch (e) { }
     }
 
@@ -1590,16 +1705,28 @@
        开启后由智慧引擎接管 AI 出击决策（比战争频率的随机撮合聪明），战争频率自动让位。 */
 
     /* 单人战力估算（与 genPower 同源的简化版，不判地形，用于战略规划） */
+    /* 战略推演的算力缓存（v1.11.7：君主多时「一个个算」会明显变慢。
+       cityGenerals 每次都要遍历城内在册 + 按战力排序，而态势评估/回防/出击
+       会在循环里反复调用同一座城 —— 用「本次推演内缓存 + 调兵后失效」把重复计算压掉。 */
+    var GENS_CACHE = {}, GENS_SKIP = null, POW_CACHE = {};
+    function clearPlanCache() { GENS_CACHE = {}; GENS_SKIP = null; POW_CACHE = {}; }
+
     function personPower(idx) {
+        if (POW_CACHE[idx] !== undefined) return POW_CACHE[idx];
         var p = personAt(idx);
         if (!p || !p.Level || p.Level <= 0) return 0;
         var thew = (p.Thew === undefined ? 100 : p.Thew);
         var k = (0.8 * (p.Force || 0) + 0.3 * (p.IQ || 0) + (p.Level || 0)) / 100;
-        return (p.Arms || 0) * (1 + safeWeight('wGen', 1) * k) * (thew / 100);
+        var v = (p.Arms || 0) * (1 + safeWeight('wGen', 1) * k) * (thew / 100);
+        POW_CACHE[idx] = v;
+        return v;
     }
 
-    /* 某城属于某势力的守军，按战力降序 */
+    /* 某城属于某势力的守军，按战力降序（本次推演内缓存） */
     function cityGenerals(c, king, skip) {
+        if (GENS_SKIP !== skip) { GENS_CACHE = {}; GENS_SKIP = skip; }
+        var key = c + '|' + king;
+        if (GENS_CACHE[key]) return GENS_CACHE[key].slice();   /* 返回副本，调用方会 splice */
         var list = personsOfCity(c), out = [], i;
         for (i = 0; i < list.length; i++) {
             var p = personAt(list[i]);
@@ -1661,6 +1788,7 @@
     /* 写出征单（战争频率与智慧引擎共用） */
     var FGT_PLAMAX = 10;              /* 引擎每方最多 10 将（src/baye/fight.h） */
     function launchAttack(srcCity, target, team) {
+        clearPlanCache();
         var idxArr = baye.data.FIGHTERS_IDX, fArr = baye.data.FIGHTERS;
         if (!idxArr || !fArr || !team || !team.length) return false;
         /* 硬约束：只能打「道路相连的相邻城池」。这张出征单是绕过引擎校验直接写进指令队列的，
@@ -1811,6 +1939,7 @@
         var level = Number(cfg.smartAI) || 0;
         if (level <= 0) return;
         try {
+            clearPlanCache();                     /* 每次月度推演从干净缓存开始 */
             var cities = baye.data.g_Cities, playerKing = baye.data.g_PlayerKing + 1;
             var kings = {}, c;
             for (c = 0; c < cities.length; c++) {
@@ -1873,7 +2002,7 @@
     function resetRunState(isNewGame) {
         info.monthReport.length = 0;
         deaths.length = 0;
-        try { localStorage.removeItem(DEATHS_KEY); } catch (e) { }
+        try { localStorage.removeItem(skey('deaths_v1')); } catch (e) { }
         TRACK.names = []; TRACK.inCity = [];
         SNAP = {};
         battleRosters = [];
@@ -1904,10 +2033,11 @@
     }
 
     function onDidLoadGame() {
-        try { reloadForge(); } catch (e) { }
+        /* 读档：切到该存档位的数据（新档期落在 tmp 的强化/台账会并到真实档位） */
+        try { loadSlotData(true); } catch (e) { }
         /* 「全员满级」是读档即生效的（不是每月累积），所以放在这里 */
         try { if (flag('levelBoostAll')) levelUpAll(false, true); } catch (e) { }
-        resetRunState();
+        resetRunState(false);
         return undefined;
     }
 
@@ -2234,31 +2364,31 @@
             }
         }
         /* 未登场 = 剧本有效人物但不在任何城池队列 */
-        var notYet = [];
+        var notYet = [], seenName = {}, k;
+        for (k = 0; k < names.length; k++) seenName[names[k]] = 1;
         for (i = 0; i < persons.length; i++) {
             var q = persons[i];
             if (!q || !q.Level || q.Level <= 0) continue;
             if (where[i] !== undefined) continue;
             var n2 = nameOf(i);
-            if (n2 && names.indexOf(n2) < 0) notYet.push(n2);
+            if (n2 && !seenName[n2]) { seenName[n2] = 1; notYet.push(n2); }
         }
         names.sort(); inCity.sort(); notYet.sort();
         var out = [monthKey().replace('-', '年') + '月 · 在城 ' + names.length
             + ' · 未登场 ' + notYet.length
             + ' · 阵亡' + deaths.length];
-        var k;
         /* 未登场全员名单（用户要求直接列人：含未成年的孙策/孙权、特定年份才出现的马岱/侯选，
-           以及作者彩蛋「通宵虫」「南方小鬼」—— 他们武力智力都是 150，此前被误当占位数据过滤） */
+           以及作者彩蛋「通宵虫」「南方小鬼」—— 他们武力智力都是 150，此前被误当占位数据过滤）。
+           v1.11.7：原先一人一行，君主多时列表能到几百行，引擎逐行渲染卡到半天没反应；
+           现在按每行 30 个半角自动打包，一行能放好几个名字，整体行数降到个位数。 */
         if (notYet.length) {
-            out.push('【未登场名单】');
-            for (k = 0; k < notYet.length && out.length < 46; k++) {
-                out.push(' ' + notYet[k]);
-            }
-            if (notYet.length > 44) out.push('（其余 ' + (notYet.length - 44) + ' 人略）');
+            out.push('【未登场 ' + notYet.length + ' 人】');
+            var packed = packNames(notYet, MENU_MAX_HALF);
+            for (k = 0; k < packed.length && out.length < 40; k++) out.push(' ' + packed[k]);
         }
         if (deaths.length) {
             out.push('【阵亡台账】共 ' + deaths.length + ' 人');
-            for (k = deaths.length - 1; k >= 0 && out.length < 60; k--) {
+            for (k = deaths.length - 1; k >= 0 && out.length < 46; k--) {
                 out.push(' ' + deaths[k].name + '(' + deaths[k].king + ')'
                     + ' ' + deaths[k].city + ' ' + deaths[k].date);
             }
@@ -2366,7 +2496,7 @@
 
        4) 只强化「装备类」道具（useflag=0），消耗品（useflag=1）不参与。 */
 
-    var FORGE_KEY = 'baye_cheat_forge_v1';
+    var FORGE_KEY = 'baye_cheat_forge_v1';      /* 旧键（仅用于一次性迁移） */
     /* 强化不设上限（用户需求）。这里只是「读档容错」用的软顶 —— 正常永远不会碰到，
        因为费用按1.3 次幂增长，到 +100 已经是天文数字，曲线本身就把等级锁死在 +15~20 区间。
        伤害系数走饱和曲线（见 forgeDmgMul），高等级自动收敛到上限，不会无限膨胀。 */
@@ -2399,7 +2529,7 @@
     var FORGE = (function () {
         var o = {};
         try {
-            var raw = localStorage.getItem(FORGE_KEY);
+            var raw = localStorage.getItem(skey('forge_v1'));
             if (raw) {
                 var d = JSON.parse(raw);
                 for (var k in d) {
@@ -2416,7 +2546,7 @@
     })();
 
     function saveForge() {
-        try { localStorage.setItem(FORGE_KEY, JSON.stringify(FORGE)); } catch (e) { }
+        try { localStorage.setItem(skey('forge_v1'), JSON.stringify(FORGE)); } catch (e) { }
     }
 
     /* 从 localStorage 重新加载强化表。
@@ -2425,7 +2555,7 @@
     function reloadForge() {
         FORGE = {};
         try {
-            var raw = localStorage.getItem(FORGE_KEY);
+            var raw = localStorage.getItem(skey('forge_v1'));
             if (raw) {
                 var d = JSON.parse(raw);
                 for (var k in d) {
@@ -2917,27 +3047,59 @@
         return -1;
     }
 
-    /* 引擎金币上限：原版机制 Money>30000 截断。
-       但不再只信硬编码 —— setCityMoney 每次写完会回读，一旦发现引擎实际给的更少，
-       就把上限自动校准成引擎的真实值（避免「以为加了 3000，引擎只让进 1」）。 */
+    /* 引擎金币上限：默认按 30000（用户实测的原版上限），
+       若引擎实际更低，写后回读会自动校准；也可在面板里手动指定（cfg.moneyCap>0 时优先）。 */
     var MONEY_SOFT_CAP = 30000;
+    var MONEY_CAP_PROBED = 0;          /* 已知的引擎实测上限（0=未知） */
+
+    function effMoneyCap() {
+        var manual = Number(cfg.moneyCap) || 0;
+        if (manual > 0) return manual;
+        if (MONEY_CAP_PROBED > 0) return MONEY_CAP_PROBED;
+        return MONEY_SOFT_CAP;
+    }
 
     /* 给单座城加钱（写后回读校准）。返回 { got, before, after, capped } */
     function setCityMoney(city, want) {
         if (!city) return { got: 0, before: 0, after: 0, capped: true };
+        var cap = effMoneyCap();
         var before = Number(city.Money) || 0;
-        if (before >= MONEY_SOFT_CAP) return { got: 0, before: before, after: before, capped: true };
-        var after = Math.min(MONEY_SOFT_CAP, before + want);
+        if (before >= cap) return { got: 0, before: before, after: before, capped: true };
+        var after = Math.min(cap, before + want);
         city.Money = after;
         var real = Number(city.Money);
         if (!isFinite(real) || real < 0) real = after;
         if (real < after) {
-            /* 引擎有更低的硬上限 → 校准上限，再按真实值补一次 */
+            /* 引擎实际给的值更少 → 说明真实硬上限更低，校准后按真实值重试一次 */
+            MONEY_CAP_PROBED = real;
             MONEY_SOFT_CAP = real;
             city.Money = Math.min(real, before + want);
             real = Number(city.Money) || 0;
         }
         return { got: real - before, before: before, after: real, capped: real < before + want };
+    }
+
+    /* 探测引擎真实金币上限：往都城写一个很大的数，看回读是多少 */
+    function probeMoneyCap() {
+        var c = capitalCity();
+        if (c < 0) { alert2('没有己方城池，无法探测'); return 0; }
+        var city = cityAt(c);
+        var old = Number(city.Money) || 0;
+        var back = 0, guess;
+        for (guess = 30000; guess >= 1000; guess = Math.round(guess / 2)) {
+            city.Money = guess;
+            back = Number(city.Money) || 0;
+            if (back >= guess) break;
+            if (guess <= 1000) break;
+        }
+        city.Money = Math.min(old, back || old);
+        MONEY_CAP_PROBED = back;
+        MONEY_SOFT_CAP = back;
+        var msg = '探测结果：引擎单城金币上限 = ' + back + '（已写回原值 ' + Math.min(old, back) + '）\n'
+            + '若与你的预期不符，可在面板「金币上限」里手动填数值（填 0 = 自动跟随探测值）';
+        alert2(msg);
+        log(msg);
+        return back;
     }
 
     /* 一夜暴富 / 资源管理「立即加钱」：
@@ -2960,11 +3122,16 @@
             if (r.capped) short = true;
         }
         if (!silent) {
-            var msg = '增加金钱 ' + total + '（计划 ' + want + '）\n' + (notes.length ? notes.join('\n') : '（没有可加的城）')
-                + '\n单城上限 ' + MONEY_SOFT_CAP;
-            if (left > 0) {
-                msg += '\n⚠ 己方城池金币已到上限，剩余 ' + left + ' 没能发放 —— '
-                    + '先花掉一些或等月入积累；也可在面板把「暴富金额」调小到剩余空间以内';
+            var capNow = effMoneyCap();
+            var msg = '增加金钱 ' + total + '（计划 ' + want + '）\n'
+                + (notes.length ? notes.join('\n') : '（没有可加的城）')
+                + '\n单城上限 ' + capNow + (MONEY_CAP_PROBED ? '（实测值）' : '（默认，可探测）');
+            if (total === 0 && want > 0) {
+                msg += '\n⚠ 一分钱都没加上：己方城池金币都已到引擎硬上限 —— 这是引擎的上限，'
+                    + '加多少都会被截断。可行办法：① 用「获取全部道具」换战力；② 提升商贸等内政让月入更���；'
+                    + '③ 若你确信上限不该这么低，点下面「重新探测上限」按钮';
+            } else if (left > 0) {
+                msg += '\n⚠ 剩余 ' + left + ' 没能发放（后面的城也已满）—— 先花掉一些或把「暴富金额」调小';
             }
             alert2(msg);
         }
@@ -3173,6 +3340,8 @@
         '#bayeCheatDock .wf.on{background:#3ec26a;border-color:#3ec26a;color:#fff;font-weight:600}',
         '#bayeCheatDock .sm{flex:1;min-width:56px;padding:7px 6px;border:1px solid #e0e0e0;background:#fafafa;border-radius:8px;font-size:12.5px;cursor:pointer;color:#333}',
         '#bayeCheatDock .sm.on{background:#3ec26a;border-color:#3ec26a;color:#fff;font-weight:600}',
+        '#bayeCheatDock .slot{flex:1;min-width:52px;padding:7px 6px;border:1px solid #e0e0e0;background:#fafafa;border-radius:8px;font-size:12.5px;cursor:pointer;color:#333}',
+        '#bayeCheatDock .slot.on{background:#3ec26a;border-color:#3ec26a;color:#fff;font-weight:600}',
         '#bayeCheatDock .tip{font-size:11px;color:#a0a0a0;margin-top:8px;line-height:1.5}',
         '#bayeCheatDock .sublabel{font-size:11.5px;color:#8a8a8a;margin-top:12px;font-weight:600}'
     ].join('');
@@ -3266,6 +3435,15 @@
             + '，没打过的城按 0 处理；缓存永久保留，控制台 <code>bayeCheat.api.waterCache()</code> 可查看。<br>'
             + '· 粮草差另计 ±15%。原版只比总兵力且 16 位求和会溢出（10.4 万兵溢出成 3.8 万），这就是「一将挡八将」的根源。'
             + '</div>';
+        html += '<h4>存档与资源</h4>'
+            + '<div class="tip" style="text-align:left">强化等级与阵亡台账按<b>存档位</b>分开保存（三个档位互不干扰）；'
+            + '新开的档在保存之前先落在<b>临时槽</b>，之后读档会自动并到对应档位。当前生效槽位：<b id="bayeCheatSlotNow">?</b>（识别不准时可手动指定）。</div>'
+            + '<div class="fn" id="bayeCheatSlot">'
+            + slotBtn('auto', '自动') + slotBtn('tmp', '临时') + slotBtn('1', '槽1') + slotBtn('2', '槽2') + slotBtn('3', '槽3')
+            + '</div>'
+            + '<div class="nums" style="margin-top:8px">' + num('moneyCap', '金币上限(0=自动)', 0) + '</div>'
+            + '<div class="fn"><button data-fn="probeCap">重新探测金币上限</button></div>'
+            + '<div class="tip" style="text-align:left">若「立即加钱」加不进去，多半是金币已到引擎硬上限。点「重新探测金币上限」会实测引擎真正的上限；也可手动填上限（0 = 跟随实测值）。</div>';
         html += '<h4>其他</h4><div class="fn">'
             + '<button data-fn="reset">恢复默认设置</button>'
             + '</div><div class="tip">月报 / 势力分布 / 排行 / 图鉴 / 跟踪都在游戏内：按 H（或触屏「帮助」）打开金手指菜单。图标可拖动，点面板外任意处收起。</div>';
@@ -3399,9 +3577,24 @@
                     saveCfg();
                     log('已恢复默认设置');
                     location.reload();
+                } else if (f === 'probeCap') {
+                    try { probeMoneyCap(); } catch (e) { alert2('探测失败：' + e.message); }
+                    refreshSlotBtns();
                 }
             };
         });
+        /* 存档槽位切换：切完立刻重载该槽的强化/台账 */
+        each(wrap.querySelectorAll('#bayeCheatSlot .slot'), function (b) {
+            b.onclick = function () {
+                var v = b.getAttribute('data-slot');
+                var real = setSlot(v);
+                log('存档槽位 → ' + real);
+                alert2('已切换到存档槽位：' + real
+                    + '\n（强化等级与阵亡台账已按该槽位重新载入）');
+                refreshSlotBtns();
+            };
+        });
+        refreshSlotBtns();
     }
 
     function saveDockPos(wrap) {
@@ -3435,6 +3628,21 @@
 
     function wfBtn(v, label) {
         return '<button class="wf' + (Number(cfg.warFreq) === v ? ' on' : '') + '" data-wf="' + v + '">' + label + '</button>';
+    }
+    function slotBtn(v, label) {
+        var cur = 'auto';
+        try { cur = localStorage.getItem(SLOT_KEY) || 'auto'; } catch (e) { }
+        return '<button class="slot' + (cur === v ? ' on' : '') + '" data-slot="' + v + '">' + label + '</button>';
+    }
+    function refreshSlotBtns() {
+        each(document.querySelectorAll('#bayeCheatSlot .slot'), function (b) {
+            b.classList.toggle('on', b.getAttribute('data-slot') === slotSelection());
+        });
+        var el = document.getElementById('bayeCheatSlotNow');
+        if (el) el.textContent = currentSlot() + '（选择：' + slotSelection() + '）';
+    }
+    function slotSelection() {
+        try { return localStorage.getItem(SLOT_KEY) || 'auto'; } catch (e) { return 'auto'; }
     }
 
     function refreshWfBtns() {

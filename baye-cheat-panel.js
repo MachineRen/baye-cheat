@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.11.8';
+    var CHEAT_VERSION = '1.11.9';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -141,6 +141,8 @@
                 /* v1.11.7：存档分槽（强化/阵亡跟随存档，三个档位分开；新档未保存用 tmp） */
                 slot: currentSlot,
                 setSlot: setSlot,
+                bindCurrent: bindCurrentSlot,
+                fingerprint: gameFingerprint,
                 saveKeys: storageSaveKeys,
                 moneyCap: function () { return MONEY_SOFT_CAP; },
                 probeMoneyCap: probeMoneyCap,
@@ -235,6 +237,47 @@
         return String(idx);
     }
 
+    /* ---------- 存档槽位绑定（v1.11.9） ----------
+       实测：.sav 是引擎（emscripten 胶水层 lcd.js）在初始化时就把 fetch/XHR 引用
+       缓存住后由 WASM 内部发起的请求，JS 层的 hook 装得太晚抓不到
+       （saveKeys() 返回空就是这个原因）。所以自动识别改走两条可靠路径：
+         ① 指纹绑定：玩家把「当前这个档」一次性标记成槽1/2/3，之后按
+            「君主 + 都城」指纹自动对上（同一君主换都城也能区分）；
+         ② 带槽位的书签：书���开头先写 slot 再注入脚本，点哪个档就用哪个槽。*/
+    var SLOT_BIND_KEY = 'baye_cheat_slot_bind_v1';   /* { '君主|都城': '1' | '2' | '3' } */
+    function slotBindings() {
+        try { return JSON.parse(localStorage.getItem(SLOT_BIND_KEY)) || {}; } catch (e) { return {}; }
+    }
+    function gameFingerprint() {
+        try {
+            var k = (baye.data.g_PlayerKing || 0);
+            var king = (k >= 0 && baye.getPersonName) ? String(baye.getPersonName(k)) : ('K' + k);
+            var cap = capitalCity();
+            var capName = cap >= 0 ? cityName(cap) : '?';
+            return king + '|' + capName;
+        } catch (e) { return ''; }
+    }
+    function bindCurrentSlot(n) {
+        var fp = gameFingerprint();
+        if (!fp) { alert2('当前游戏状态读不到，无法绑定槽位'); return ''; }
+        var b = slotBindings();
+        /* 同一指纹只允许绑定一个槽，避免重复绑定造成歧义 */
+        for (var k in b) { if (b.hasOwnProperty(k) && b[k] === n) delete b[k]; }
+        b[fp] = String(n);
+        try { localStorage.setItem(SLOT_BIND_KEY, JSON.stringify(b)); } catch (e) { }
+        log('已把「' + fp + '」绑定到槽' + n);
+        alert2('已绑定：\n君主/都城特征 = ' + fp + '\n→ 槽' + n
+            + '\n\n以后只要读到带这个特征的存档，就自动使用槽' + n + ' 的强化与阵亡数据。'
+            + '\n（换君主或换都城后需要重新绑定一次）');
+        return fp;
+    }
+    function slotFromBinding() {
+        var fp = gameFingerprint();
+        if (!fp) return '';
+        var b = slotBindings();
+        return b[fp] ? String(b[fp]) : '';
+    }
+
     function autoSlotId() {
         try {
             var d = baye.data, ks = ['g_SaveSlot', 'g_SaveIndex', 'g_SaveNo', 'g_SaveID', 'g_SlotIndex'], i, v, n;
@@ -247,6 +290,8 @@
             }
             var m = /[?&](?:slot|save|s)=([0-9]+)/i.exec(String((window.location && window.location.search) || ''));
             if (m) return 'slot' + m[1];
+            var sb = slotFromBinding();                  /* 君主+都城 指纹绑定（最可靠） */
+            if (sb) return 'slot' + sb;
             var sf = slotFromSaveFile();
             if (sf) return 'slot' + sf;
         } catch (e) { }
@@ -320,7 +365,7 @@
             }
         } catch (e) { }
         for (i = 0; i < SAVE_FILES.length; i++) out.push('SAV ' + SAVE_FILES[i] + ' → 槽' + (i + 1));
-        if (!out.length) out.push('（没抓到存档键：引擎用的是 baye/data/*.sav 文件，不走 localStorage）');
+        if (!out.length) out.push('（未抓到：引擎的 baye/data/*.sav 由 WASM 内部发起请求读取，JS 拦不到；请用面板「把当前档标记为槽N」或带槽位书签）');
         return out;
     }
 
@@ -2117,8 +2162,13 @@
     }
 
     function onDidLoadGame() {
-        /* 读档：切到该存档位的数据（新档期落在 tmp 的强化/台账会并到真实档位） */
+        /* 读档：按「君主+都城」指纹/URL 参数切到该存档位的数据
+           （新档期落在 tmp 的强化/台账会并到真实档位） */
+        var before = currentSlot();
         try { loadSlotData(true); } catch (e) { }
+        if (currentSlot() !== before) {
+            log('读档：存档槽位 ' + before + ' → ' + currentSlot() + '（已载入该档的强化与台账）');
+        }
         /* 「全员满级」是读档即生效的（不是每月累积），所以放在这里 */
         try { if (flag('levelBoostAll')) levelUpAll(false, true); } catch (e) { }
         resetRunState(false);
@@ -3426,6 +3476,8 @@
         '#bayeCheatDock .sm.on{background:#3ec26a;border-color:#3ec26a;color:#fff;font-weight:600}',
         '#bayeCheatDock .slot{flex:1;min-width:52px;padding:7px 6px;border:1px solid #e0e0e0;background:#fafafa;border-radius:8px;font-size:12.5px;cursor:pointer;color:#333}',
         '#bayeCheatDock .slot.on{background:#3ec26a;border-color:#3ec26a;color:#fff;font-weight:600}',
+        '#bayeCheatDock .bind{flex:1;min-width:74px;padding:7px 6px;border:1px dashed #bcd8c4;background:#f4fbf6;border-radius:8px;font-size:12px;cursor:pointer;color:#2c7a4b}',
+        '#bayeCheatDock .bind:hover{background:#e8f6ee}',
         '#bayeCheatDock .tip{font-size:11px;color:#a0a0a0;margin-top:8px;line-height:1.5}',
         '#bayeCheatDock .sublabel{font-size:11.5px;color:#8a8a8a;margin-top:12px;font-weight:600}'
     ].join('');
@@ -3521,10 +3573,17 @@
             + '</div>';
         html += '<h4>存档与资源</h4>'
             + '<div class="tip" style="text-align:left">强化等级与阵亡台账按<b>存档位</b>分开保存（三个档位互不干扰）；'
-            + '新开的档在保存之前先落在<b>临时槽</b>，之后读档会自动并到对应档位。当前生效槽位：<b id="bayeCheatSlotNow">?</b>（识别不准时可手动指定）。</div>'
+            + '新开的档在保存之前先落在<b>临时槽</b>。<b>当前生效槽位：<span id="bayeCheatSlotNow">?</span></b><br>'
+            + '引擎的存档是 <code>baye/data/sango*.sav</code> 文件，由引擎内部通过 WASM 发起请求读取，'
+            + '网页脚本拦不到，所以自动识别有两条路：<b>①</b> 下面「把当前这个档标记为槽N」，'
+            + '标记过一次之后按「君主+都城」自动对上（三个档各标记一次即可长期自动）；'
+            + '<b>②</b> 用说明页里的<b>带槽位书签</b>，点哪个档就用哪个槽。</div>'
             + '<div class="fn" id="bayeCheatSlot">'
             + slotBtn('auto', '自动') + slotBtn('tmp', '临时') + slotBtn('1', '槽1') + slotBtn('2', '槽2') + slotBtn('3', '槽3')
             + '</div>'
+            + '<div class="sublabel">把当前读入的存档标记为（三个档各点一次，以后全自动）</div>'
+            + '<div class="fn" id="bayeCheatBind">'
+            + bindBtn(1) + bindBtn(2) + bindBtn(3) + '</div>'
             + '<div class="nums" style="margin-top:8px">' + num('moneyCap', '金币上限(0=自动)', 0) + '</div>'
             + '<div class="fn"><button data-fn="probeCap">重新探测金币上限</button></div>'
             + '<div class="tip" style="text-align:left">若「立即加钱」加不进去，多半是金币已到引擎硬上限。点「重新探测金币上限」会实测引擎真正的上限；也可手动填上限（0 = 跟随实测值）。</div>';
@@ -3686,6 +3745,13 @@
                 refreshSlotBtns();
             };
         });
+        /* 一次性把当前读入的存档标记为某个槽位（三个档各点一次即可长期自动） */
+        each(wrap.querySelectorAll('#bayeCheatBind .bind'), function (b) {
+            b.onclick = function () {
+                var n = b.getAttribute('data-bind');
+                if (bindCurrentSlot(n)) { loadSlotData(false); refreshSlotBtns(); }
+            };
+        });
         refreshSlotBtns();
     }
 
@@ -3726,12 +3792,19 @@
         try { cur = localStorage.getItem(SLOT_KEY) || 'auto'; } catch (e) { }
         return '<button class="slot' + (cur === v ? ' on' : '') + '" data-slot="' + v + '">' + label + '</button>';
     }
+    function bindBtn(n) {
+        return '<button class="bind" data-bind="' + n + '">当前档→槽' + n + '</button>';
+    }
     function refreshSlotBtns() {
         each(document.querySelectorAll('#bayeCheatSlot .slot'), function (b) {
             b.classList.toggle('on', b.getAttribute('data-slot') === slotSelection());
         });
         var el = document.getElementById('bayeCheatSlotNow');
-        if (el) el.textContent = currentSlot() + '（选择：' + slotSelection() + '）';
+        if (el) {
+            var fp = gameFingerprint();
+            el.textContent = currentSlot() + '（选择：' + slotSelection()
+                + (slotSelection() === 'auto' ? (fp ? '，本局特征 ' + fp : '，未绑定特征') : '') + '）';
+        }
     }
     function slotSelection() {
         try { return localStorage.getItem(SLOT_KEY) || 'auto'; } catch (e) { return 'auto'; }

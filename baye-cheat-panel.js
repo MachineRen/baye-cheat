@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.11.7';
+    var CHEAT_VERSION = '1.11.8';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -38,6 +38,9 @@
     var TIMER = null;
 
     function bootstrap() {
+        /* 尽早挂上存档文件监听：读档发生在玩家点「读档」时，
+           必须在 install 之前就位，否则抓不到当前载入的是哪个 .sav。 */
+        try { hookSaveLoaders(); } catch (e) { }
         /* 页面在 lib 脚本 eval 之前尚未建立 baye.data，故分两条路径：
            · 早注入 → 挂 preScriptInit，等引擎初始化完成后再装钩子；
            · 晚注入 → 直接装钩子。 */
@@ -174,6 +177,64 @@
        都拿不到就用 'tmp'，并在控制台打印候选存档键，便于进一步确认。 */
     var SLOT_KEY = 'baye_cheat_slot_v1';         /* 面板选择：auto / tmp / 1 / 2 / 3 */
     var SLOT_MARK = 'baye_cheat_last_slot_v1';  /* 上次实际使用的槽（用于 tmp→档位 迁移） */
+    /* ---------- 存档位识别（v1.11.8） ----------
+       实测：引擎的存档不是 localStorage，而是文件 —— 控制台能看到
+       「Loading baye/data/sango0.sav / sango2.sav / sango4.sav / sango6.sav」。
+       所以这里 hook fetch / XMLHttpRequest，记录「实际被读取过的 .sav 文件」，
+       最后读到的那个就是当前载入的存档；按出现顺序映射成槽1/槽2/槽3…
+       引擎字段（g_SaveSlot 等）与 URL 参数仍作为优先来源。 */
+    var SAVE_FILES = [];              /* 按时间顺序记录读过的存档文件（去重） */
+    function noteSaveFile(url) {
+        if (!url) return;
+        var m = /([a-z0-9_-]+\.sav)(?:\?|#|$)/i.exec(String(url));
+        if (!m) return;
+        var f = m[1];
+        if (SAVE_FILES.indexOf(f) < 0) {
+            SAVE_FILES.push(f);
+            log('检测到存档文件：' + f + '（当前 ' + SAVE_FILES.length + ' 个）');
+        }
+    }
+    function hookSaveLoaders() {
+        try {
+            var of = window.fetch;
+            if (typeof of === 'function' && !of.__bayeSaveHook) {
+                var wrapped = function (input, init) {
+                    try {
+                        noteSaveFile(typeof input === 'string' ? input
+                            : (input && input.url) || (input && input.toString && input.toString()));
+                    } catch (e) { }
+                    return of.apply(this, arguments);
+                };
+                wrapped.__bayeSaveHook = 1;
+                window.fetch = wrapped;
+            }
+        } catch (e) { }
+        try {
+            var XO = XMLHttpRequest.prototype.open;
+            if (typeof XO === 'function' && !XO.__bayeSaveHook) {
+                var hooked = function (method, url) {
+                    try { noteSaveFile(url); } catch (e) { }
+                    return XO.apply(this, arguments);
+                };
+                hooked.__bayeSaveHook = 1;
+                XMLHttpRequest.prototype.open = hooked;
+            }
+        } catch (e2) { }
+        /* 已经读过的（脚本注入前发生的请求）从 Resource Timing 里补捞 */
+        try {
+            var es = (window.performance && performance.getEntriesByType) ? performance.getEntriesByType('resource') : [];
+            for (var i = 0; i < es.length; i++) {
+                if (/\.sav(\?|#|$)/i.test(es[i].name || '')) noteSaveFile(es[i].name);
+            }
+        } catch (e3) { }
+    }
+    /* 当前读到的存档 → 槽位号（按首次出现顺序编号，1 起） */
+    function slotFromSaveFile() {
+        if (!SAVE_FILES.length) return '';
+        var idx = SAVE_FILES.length;                    /* 最后读到的那个 */
+        return String(idx);
+    }
+
     function autoSlotId() {
         try {
             var d = baye.data, ks = ['g_SaveSlot', 'g_SaveIndex', 'g_SaveNo', 'g_SaveID', 'g_SlotIndex'], i, v, n;
@@ -186,6 +247,8 @@
             }
             var m = /[?&](?:slot|save|s)=([0-9]+)/i.exec(String((window.location && window.location.search) || ''));
             if (m) return 'slot' + m[1];
+            var sf = slotFromSaveFile();
+            if (sf) return 'slot' + sf;
         } catch (e) { }
         return '';
     }
@@ -243,7 +306,7 @@
             deaths = JSON.parse(localStorage.getItem(skey('deaths_v1')) || '[]') || [];
         } catch (e5) { deaths = []; }
     }
-    /* 存档键候选（诊断用）：引擎把存档放在哪、叫什么名字 */
+    /* 存档键候选（诊断用）：localStorage 扫描 + 实际读过的 .sav 文件 */
     function storageSaveKeys() {
         var out = [], i, k, v;
         try {
@@ -252,10 +315,12 @@
                 if (!k || k.indexOf('baye_cheat_') === 0) continue;
                 v = localStorage.getItem(k) || '';
                 if (/save|slot|存档|进度/i.test(k) || (v.length > 2000 && /^\s*[{[]/.test(v))) {
-                    out.push(k + '(' + Math.round(v.length / 1024) + 'KB)');
+                    out.push('LS ' + k + '(' + Math.round(v.length / 1024) + 'KB)');
                 }
             }
         } catch (e) { }
+        for (i = 0; i < SAVE_FILES.length; i++) out.push('SAV ' + SAVE_FILES[i] + ' → 槽' + (i + 1));
+        if (!out.length) out.push('（没抓到存档键：引擎用的是 baye/data/*.sav 文件，不走 localStorage）');
         return out;
     }
 
@@ -423,7 +488,23 @@
     }
 
     /* ---------- 输出包装：统一在这里做编码过滤，业务代码不用关心 ---------- */
-    function alert2(msg) { try { baye.alert(gbkSafe(msg)); } catch (e) { } }
+    /* iOS Safari 上引擎自己的弹窗实现偶尔会抛
+       「baye._cbs.pop() is not a function」（引擎内部 UI 回调栈异常），
+       抛错后弹窗卡死、还弹原生错误框。这里做重试 + 自绘兜底，
+       保证「提示」这件事不会把游戏卡住。 */
+    var ALERT_RETRY = 0;
+    function alert2(msg) {
+        var text = gbkSafe(msg);
+        if (ALERT_RETRY > 3) { log('alert 多次失败，改用控制台输出：', text); return; }
+        try {
+            ALERT_RETRY++;
+            baye.alert(text);
+            ALERT_RETRY = 0;
+        } catch (e) {
+            log('alert 失败（第 ' + ALERT_RETRY + ' 次）：', e);
+            setTimeout(function () { alert2(text); }, 150);
+        }
+    }
     function say2(pid, msg) { try { baye.say(pid, gbkSafe(msg)); } catch (e) { } }
     /* 菜单列表项上限：每行最多 30 个半角（15 个汉字）。
        超宽项先在本脚本里折行 —— 引擎对超宽行会自动换行，把列表排版搅乱。 */
@@ -983,6 +1064,9 @@
     function safeWeight(k, def) {
         var v = Number(cfg[k]);
         if (!isFinite(v) || v < 0) return def;
+        /* 关键金额项下限保护：iOS Safari 上输入框偶尔被表单恢复成 1，
+           若不兜底，一夜暴富就变成「加 1 金」。 */
+        if (k === 'richAmount' && v > 0 && v < 100) return def;
         return v;
     }
 
@@ -3529,12 +3613,20 @@
         each(wrap.querySelectorAll('.nums input'), function (inp) {
             inp.onchange = function () {
                 var k = inp.getAttribute('data-n');
-                cfg[k] = parseFloat(inp.value) || 0;
+                var v = numValid(k, inp.value);
+                if (v === null) {                       /* 非法输入：丢弃并回填当前值 */
+                    var cur = Number(cfg[k]);
+                    log('忽略非法输入 ' + k + '=' + inp.value);
+                    try { inp.value = isFinite(cur) ? cur : 0; } catch (e) { }
+                    return;
+                }
+                cfg[k] = v;
                 saveCfg();
                 if (k === 'deathRate') applyEngineSwitches();
                 if (k === 'richAmount') { try { doRich(true); } catch (e) { } }
             };
         });
+        syncNumInputs();
         each(wrap.querySelectorAll('#bayeCheatSm .sm'), function (b) {
             b.onclick = function () {
                 var v = Number(this.getAttribute('data-sm'));
@@ -3683,7 +3775,31 @@
     }
 
     function num(k, label, step) {
-        return '<label>' + label + '<input type="number" step="' + step + '" data-n="' + k + '" value="' + cfg[k] + '"></label>';
+        var v = cfg[k];
+        if (typeof v !== 'number' || !isFinite(v)) v = 0;
+        return '<label>' + label + '<input type="number" inputmode="numeric" autocomplete="off" autocorrect="off"'
+            + ' spellcheck="false" min="0" step="' + step + '" data-n="' + k + '" value="' + v + '"></label>';
+    }
+    /* 数字输入兜底（iOS Safari 实测踩过的坑）：
+       手机上「暴富金额」会莫名变成 1，导致加钱只 +1。
+       三个防护：① 面板打开时用 cfg 回填输入框（压掉 Safari 的表单值恢复）；
+       ② onchange 校验，非法/过小值直接丢弃并回填；
+       ③ safeWeight 对关键金额项做下限保护。 */
+    function numValid(k, raw) {
+        var v = Number(raw);
+        if (!isFinite(v) || v < 0) return null;
+        if (k === 'richAmount' && v > 0 && v < 100) return null;      /* 金额小于 100 视为误输入 */
+        if (k === 'wGen' || k === 'wArms' || k === 'wDef' || k === 'spread' || k === 'moneyCap') {
+            if (v > 0 && v < 0.001) return null;
+        }
+        return v;
+    }
+    function syncNumInputs() {
+        each(document.querySelectorAll('#bayeCheatDock .nums input'), function (inp) {
+            var k = inp.getAttribute('data-n');
+            var v = Number(cfg[k]);
+            if (isFinite(v)) { try { inp.value = v; } catch (e) { } }
+        });
     }
 
     /* ======================== 9. 启动 ======================== */

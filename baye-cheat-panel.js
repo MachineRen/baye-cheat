@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.11.3';
+    var CHEAT_VERSION = '1.11.4';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -580,9 +580,11 @@
             /* 关键：把参战槽位清零。引擎的 TheLoserDeal 只遍历战场队列、不看人当前在哪座城，
                不摘出槽位的话，人虽然被搬走了照样会被 HoldCaptive 抓走 */
             if (slot !== undefined) { try { fp.GenArray[slot] = 0; } catch (e) { } }
+            /* 只从「战败城」移出（这一步必须即时，否则城破时 BeOccupied 会抓到他），
+               投进自己城池的动作推迟到月末 —— 见PENDING_PLACE 注释 */
             var from = cityOfPerson(idx0);
-            if (from !== 0xff) { try { baye.deletePersonInCity(from, idx0); } catch (e) { } }
-            placePerson(dest, idx0);
+            if (from !== 0xff && from !== dest) { try { baye.deletePersonInCity(from, idx0); } catch (e) { } }
+            queuePlace(idx0, dest);
             p.Belong = idx0 + 1;                           /* 仍是自家君主 */
             p.Arms = Math.max(1, Math.floor(p.Arms / 2));  /* 退兵损失 */
             p.Thew = Math.max(10, p.Thew - 30);            /* 重伤 */
@@ -606,6 +608,51 @@
         }
         reportRescued(rescued, verbose);
         return rescued;
+    }
+
+    /* 君主抢救的「归位」延后到月末做（v1.11.4，双 VS 偶发的头号嫌疑）：
+       战斗结算画面期间只做三件「不碰城池名册」的事 ——
+         ① 把参战槽位清零（必须即时：TheLoserDeal/BeOccupied 只看战场队列与城内在册，
+            不清零的话君主照样被 HoldCaptive 抓走，「免疫俘虏」就失效了）；
+         ② 改回自有归属（纯字段写��，不涉及队列）；
+         ③ 退兵损失（兵力折半 + 重伤）。
+       「从战败城删人 + 投进另一座城」这种名册增删一律推迟到月末 tacticStage5 统一做，
+       期间君主处于「不在任何城名册」的��军态 —— 这正是引擎表示行军部队的方式，
+       不会让势力判定为灭亡。这样战斗动画期间不再有城内在册变动，
+       偶发的「横幅画两遍（双 VS）」触发条件被去掉。 */
+    var PENDING_PLACE = {};      /* pid -> { city: 目标城号, name: 姓名 } */
+    function queuePlace(pid, city) {
+        if (PENDING_PLACE[pid]) return;
+        PENDING_PLACE[pid] = { city: city, name: nameOf(pid) };
+    }
+    function isPendingPlace(pid) { return !!PENDING_PLACE[pid]; }
+    function flushPendingPlace(verbose) {
+        var notes = [], k, pid, d, p, oc, city, from;
+        for (k in PENDING_PLACE) {
+            if (!PENDING_PLACE.hasOwnProperty(k)) continue;
+            pid = Number(k);
+            d = PENDING_PLACE[pid];
+            p = personAt(pid);
+            if (!p) { delete PENDING_PLACE[k]; continue; }
+            oc = ownCities(p.Belong);
+            /* 目标城若已易主，改投当前自己的第一座城 */
+            city = (d && oc.indexOf(d.city) >= 0) ? d.city : (oc.length ? oc[0] : -1);
+            if (city < 0) {
+                notes.push(d.name + ' 无城可归（本月仍在行军态）');
+                delete PENDING_PLACE[k];
+                continue;
+            }
+            from = cityOfPerson(pid);
+            if (from !== 0xff && from !== city) { try { baye.deletePersonInCity(from, pid); } catch (e) { } }
+            placePerson(city, pid);
+            notes.push(d.name + ' 归位 ' + cityName(city));
+            delete PENDING_PLACE[k];
+        }
+        if (notes.length) {
+            pushReport('【退兵】' + notes.join('、'));
+            if (verbose) alert2('【君主归位】' + notes.join('、'));
+        }
+        return notes;
     }
 
     function reportRescued(rescued, verbose) {
@@ -1041,6 +1088,7 @@
             for (i = 0; i < r.pids.length; i++) {
                 var pid = r.pids[i];
                 if (pid === undefined || deadSeen[pid] || busy2[pid]) continue;
+                if (isPendingPlace(pid)) continue;          /* 月初刚归位中的君主（在路上）不算阵亡 */
                 var p = personAt(pid);
                 if (!p) continue;
                 if (where[pid] !== undefined) continue;       /* 在城里，没事 */
@@ -1455,7 +1503,23 @@
     function alreadyAttacked(c) {
         var mk = monthKey();
         if (ATTACKED.month !== mk) { ATTACKED.month = mk; ATTACKED.targets = {}; }
-        return !!ATTACKED.targets[c];
+        if (ATTACKED.targets[c]) return true;
+        /* 引擎自己的指令队列里若已有攻这座城的单（我们和原版AI 都可能排上），
+           就不再排第二场 —— 同一座城同月排两场，战斗画面会叠出两条横幅 */
+        try {
+            var q = baye.data.g_OrderQueue, i;
+            for (i = 0; i < q.length; i++) {
+                if (q[i] && q[i].OrderId === 27 && q[i].Object === c) return true;
+            }
+        } catch (e) { }
+        /* 本月已经打过这座城（引擎已结算过） */
+        try {
+            var mk2 = monthKey(), b;
+            for (b = 0; b < battleRosters.length; b++) {
+                if (battleRosters[b].city === c && battleRosters[b].month === mk2) return true;
+            }
+        } catch (e2) { }
+        return false;
     }
     function markAttacked(c) {
         var mk = monthKey();
@@ -1806,6 +1870,8 @@
            但槽位键是「武将下标_槽位」，换档后同一位置的道具可能完全不同，
            所以只在新开局时校验一次：槽位上的道具名与记录不符就丢弃该记录。 */
         forgeValidate();
+        PENDING_PLACE = {};            /* 新开局：清空「待归位君主」 */
+        ATTACKED.month = ''; ATTACKED.targets = {};
         log('已重置本局运行数据（月报/台账/跟踪基线）');
     }
 
@@ -1824,6 +1890,9 @@
 
     function onTacticStage5() {
         var notes = [];
+        /* 君主归位（v1.11.4）：战斗期间只从战败城摘人、投进自己城池的动作统一挪到月末。
+           同样卡在 lib 的 tacticStage5 之前执行（wrapHook 先跑本函数再跑原钩子）。 */
+        try { notes = notes.concat(flushPendingPlace(false) || []); } catch (e) { log('君主归位异常', e); }
         /* 必须在 lib 的 tacticStage5「敌方俘虏入城」之前把君主放回去 ——
            wrapHook 先跑本函数再跑原钩子，正好卡在这个位置。 */
         try { notes = notes.concat(rollbackCapturedKings(false) || []); } catch (e) { log('君主回滚异常', e); }

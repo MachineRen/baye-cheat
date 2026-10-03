@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.11.2';
+    var CHEAT_VERSION = '1.11.3';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -175,6 +175,8 @@
         noDeathRescue: 0,    // 阵亡补救：默认关（开局未登场武将易被误判成阵亡），需要时再开
         kingGuard: 1,        // 君主免疫俘虏（有城可退时改为转移+重伤）
         autoBalance: 1,      // AI 托管战斗加权结算
+        engineSettle: 0,     // 托管战斗交还引擎结算（默认关）。开启后战斗横幅不再出现双 VS，
+                             // 代价：AI 托管战斗不再记月报/参战名单，也不做君主战场抢救
         noDisaster: 0,       // 城池无灾害：默认关闭，尊重原机制
         waterTactic: 1,      // 水城地形修正：水域战场按兵种水性折算战力（北海/吴/桂阳）
         forge: 1,            // 铁匠铺：装备强化（DNF 式）。强化等级独立记录，不改引擎面板数值
@@ -874,7 +876,21 @@
         try {
             var fp = baye.data.g_FgtParam;
             if (!fp || fp.Mode !== FGT_AUTO) return undefined;
+            /* 诊断开关：完全交还引擎结算（不接管胜负）。
+               AI 托管战斗一旦被我们 return 0 接管，引擎的 FgtCountWon() 就不会跑 ——
+               而它除了判胜负还负责战斗结算段的收尾绘制，Skipping 后战斗动画里
+               「X军 vs Y军」横幅会被画两遍（双 VS）。开着这个开关即可 A/B 验证。 */
+            if (cfg.engineSettle) return undefined;
             diag.fightCountWinner += 1;
+
+            /* 先让原版钩子跑完：lib 若注册过 fightCountWinner，它负责引擎结算前的准备工作。
+               我们只覆盖它给出的胜负，这样引擎该走的收尾流程不会因为我们 return 0 被整段跳过。 */
+            try {
+                var origHook = wrappedHooks.fightCountWinner;
+                if (typeof origHook === 'function' && !origHook.__bayeCheatWrap) {
+                    origHook.call(baye.hooks, undefined);
+                }
+            } catch (e) { log('原版托管结算钩子异常（继续接管）：', e); }
 
             var mustOverride = flag('autoBalance') || Number(cfg.deathRate) > 0;
             var win;
@@ -3037,6 +3053,7 @@
         { k: 'noDeathRescue', t: '自动阵亡补救', d: '默认关。开启后每月自动把「上月确实在城、本月消失」的武将按重伤找回；也可以在游戏内「武将修复」里逐个选人找回' },
         { k: 'kingGuard', t: '君主免疫俘虏', d: '势力仍有城池可退时，君主改为转移+重伤；只剩最后一城时照常被俘（保留灭国代价）。每月还会做一次城池名册自愈：君主/武将错列或重复在册会自动归位' },
         { k: 'autoBalance', t: 'AI 托管战斗加权结算', d: '武将战力×兵力×城防×战场地形加权，替代原版「只比总兵力」，杜绝一将挡八将' },
+        { k: 'engineSettle', t: '托管战斗交还引擎结算', d: '默认关。开启后 AI 之间的战斗完全按引擎原版流程结算（战斗动画里的「双 VS」重叠即由此开关验证）；代价是这类战斗不再记入月报/参战名单，也不在战场抢救君主' },
         { k: 'noDisaster', t: '城池无灾害', d: '默认关闭（尊重原机制）。开启后每月把己方城池防灾值拉满并清除已有的饥荒/旱灾/水灾/暴动' },
         { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（等级不设上限），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
         { k: 'forgePity', t: '强化保底', d: '默认开启。连续失败 5 次后下一次必定成功，避免高等级陷入无限掉级（+11 以上成功率仅 18%~9%）' },

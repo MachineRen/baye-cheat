@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.12.1';
+    var CHEAT_VERSION = '1.14.0';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -149,6 +149,39 @@
                 engineSaves: engineSaveList,
                 reeHook: hookEngineSaveIO,
                 moneyCap: function () { return MONEY_SOFT_CAP; },
+                food: doFood,
+                resCap: function () { return { money: RES_CAP_MONEY, food: RES_CAP_FOOD, writeMax: RES_WRITE_MAX, carry: RES_CARRY }; },
+                /* 手动补到上限 */
+                refill: function () { return refillResources(true); },
+                /* 手动跑一次「被削就补」的恢复（诊断用） */
+                restoreRes: function () { recordResBase(); restoreResIfClamped(); return true; },
+                /* 彻底测一次：写 65535 看引擎给多少（回答「金币上限能不能破」） */
+                probeGold: function () {
+                    var c = capitalCity();
+                    if (c < 0) return0;
+                    var city = cityAt(c), old = Number(city.Money) || 0, out = [];
+                    [100000, 65535, 60000, 45000, 30001, 30000].forEach(function (v) {
+                        city.Money = v;
+                        var back = Number(city.Money) || 0;
+                        out.push('写 ' + v + ' → ' + back + (back < v ? '（被截）' : '（写入成功）'));
+                        city.Money = old;
+                    });
+                    var msg = '金币上限实测（' + cityName(c) + '）：\n' + out.join('\n')
+                        + '\n\n结论：' + (out[1].indexOf('（写入成功）') >= 0
+                            ? '引擎允许超过 30000，说明之前看到的 30000 是月结钳制，可通过月初补回绕过'
+                            : '字段本身就被钳在 30000，脚本无法突破（只能改引擎 WASM）');
+                    alert2(msg); log(msg);
+                    return out;
+                },
+                resetResCarry: function () { RES_CARRY = {}; RES_SNAP = {}; return true; },
+                resetResState: function () { RES_LAST = {}; return true; },
+                setResLast: function (c, v) { RES_LAST[c] = v; return true; },
+                /* 引擎配置一览：用来确认金币/粮草上限是不是可配置参数 */
+                engineConfig: function () {
+                    var ec = baye.data.g_engineConfig, out = {};
+                    try { for (var k in ec) { if (ec.hasOwnProperty(k)) out[k] = ec[k]; } } catch (e) { }
+                    return out;
+                },
                 probeMoneyCap: probeMoneyCap,
                 /* 换月/读档时清空「本月已打过」账本；控制台与测试也用它复位 */
                 resetAttackLog: function () { ATTACKED.month = ''; ATTACKED.targets = {}; return true; },
@@ -521,12 +554,13 @@
         forgePity: 1,        // 强化保底：连续失败 5 次后，下一次必定成功（防止无限掉级）
         forgeGuarantee: 0,   // 强化必定成功：成功率强制 100%（测试/刷满级用，费用照收）
         forgeMount: 0,       // 允许强化纯坐骑：默认关（纯坐骑只加移动、不加伤害，强化收益为0）
-        richMode: 0,          // 一夜暴富：每月给君主所在城塞一笔钱（配合引擎经济，量级见 richAmount）
-        richAmount: 3000,     // 一夜暴富每月注入的钱（单城上限由引擎决定，可用 moneyCap 覆盖）
-        moneyCap: 0,          // 0 = 自动（写后回读校准 / 面板探测）；>0 = 手动指定单城金币上限
+        richMode: 0,          // 【已从面板移除】每月自动加钱（保留内部开关，资源管理菜单的手动加钱不受影响）
+        richAmount: 3000,     // 每次加的钱/粮：立即加钱、立即加粮、每月自动都按这个额度
+        moneyCap: 0,          // 【已从面板移除】0 = 自动校准；>0 = 手动指定金币上限（控制台可用）
         allTools: 0,          // 获取全部道具：每月把全道具表塞进君主所在城
         levelBoost: 0,        // 武将等级提升：每月给己方武将加经验（全员涨级）
-        levelBoostAll: 0,     // 全员满级：开局/读档时把己方武将直接拉到等级上限
+        levelBoostAll: 0,     // 【已从面板移除】读档即满级（保留内部开关）
+        noResCap: 1,          // 解除资源上限：每月月初把己方城池金币/粮草补到引擎上限（强化要用大量金币）
 
         aiEmptyCity: 1,      // AI 攻占空城：原版 AI 永远不打无主城，开启后每月让相邻 AI 势力去占
         warFreq: 0,          // 出征频率（智慧引擎二级微调）：0=保守 1=正常 2=活跃（联动出击门槛 1.35/1.20/1.05）；smartAI=0 时不生效
@@ -832,6 +866,63 @@
         } catch (e) { }
     }
 
+    /* ---------- 5.8 月报补两类事件：投奔 + 灾害（对齐霸哥自制版） ----------
+       霸哥版月报里有这两类 ours 缺失：
+         [董卓] 伍习 投奔 公孙瓒   —— 武将换势力（引擎自己发生的野将投奔）
+         建宁 发生 水灾                      —— 城池灾害
+       都不需要引擎事件回调：每月月初拿上月的 SNAP（归属）做差分即可。 */
+    /* 轻量归属快照：只记 Belong，与noDeath 开关无关（投奔差分靠它） */
+    var BELONG_SNAP = null;
+    function snapshotBelong() {
+        var persons = baye.data.g_Persons, m = {}, i;
+        for (i = 0; i < persons.length; i++) {
+            var p = persons[i];
+            if (p && p.Level && p.Level > 0) m[i] = p.Belong;
+        }
+        BELONG_SNAP = m;
+    }
+    var DISASTER_SNAP = null;
+    var DISASTER_NAME = { 1: '水灾', 2: '旱灾' };
+    function disasterName(v) { return DISASTER_NAME[v] || ('灾害(' + v + ')'); }
+    function reportDefectionsAndDisasters() {
+        var out = [], persons = baye.data.g_Persons, cities = baye.data.g_Cities, i, c, p, s, nb, ob;
+        /* ① 投奔：上月归属 A、本月变成 B（排除俘虏/在野/君主本人） */
+        if (BELONG_SNAP) {
+            for (i = 0; i < persons.length; i++) {
+                p = persons[i];
+                if (!p || !p.Level || p.Level <= 0) continue;
+                ob = BELONG_SNAP[i];
+                if (ob === undefined) continue;
+                nb = p.Belong;
+                if (nb === ob) continue;
+                if (nb === CAPTIVE || nb === WILD || nb <= 0) continue;
+                if (ob === CAPTIVE || ob === WILD || ob <= 0) continue;
+                if (i + 1 === nb || i + 1 === ob) continue;
+                /* 区分「城破吞并」与「主动投奔」：
+                   旧主势力已灭（名下无城）或这座城已易主 → 武将是被动的，不算投奔。*/
+                if (ownCities(ob).length === 0) continue;   /* 旧主已灭 → 吞并，不算投奔 */
+                var here = cityOfPerson(i);
+                out.push('【投奔】' + safeName(ob) + '军 ' + nameOf(i) + ' 投奔 ' + safeName(nb)
+                    + (here !== 0xff ? '（' + cityName(here) + '）' : ''));
+            }
+        }
+        /* ② 灾害：city.State 上月为 0、本月非 0 → 本月发生灾害 */
+        if (DISASTER_SNAP) {
+            for (c = 0; c < cities.length; c++) {
+                var cd = cities[c];
+                if (!cd) continue;
+                var st = Number(cd.State) || 0;
+                if (st !== 0 && (DISASTER_SNAP[c] || 0) === 0) {
+                    log('灾害：' + cityName(c) + ' 发生 ' + disasterName(st));
+                }
+            }
+        }
+        DISASTER_SNAP = {};
+        for (c = 0; c < cities.length; c++) if (cities[c]) DISASTER_SNAP[c] = Number(cities[c].State) || 0;
+        if (out.length) pushReport(out);
+        return out;
+    }
+
     /* ---------- 5.2 需求3 补强：战死者按快照找回 ----------
        快照在每月月初（tacticStage1）采集：每个武将的势力/等级/兵力/体力/装备/所在城。
        下月月初比对，若某人「不在任何城池」→ 判定为永久消失（战死/被清除），
@@ -1017,11 +1108,11 @@
             from = cityOfPerson(pid);
             if (from !== 0xff && from !== city) { try { baye.deletePersonInCity(from, pid); } catch (e) { } }
             placePerson(city, pid);
-            notes.push(d.name + ' 归位 ' + cityName(city));
+            notes.push('【退兵】' + d.name + ' 归位 ' + cityName(city));
             delete PENDING_PLACE[k];
         }
         if (notes.length) {
-            pushReport('【退兵】' + notes.join('、'));
+            pushReport(notes.join('、'));
             if (verbose) alert2('【君主归位】' + notes.join('、'));
         }
         return notes;
@@ -1114,22 +1205,55 @@
             }
             b = p.Belong;
             var keeper = -1, k;
-            if (b !== WILD && b !== CAPTIVE && b !== undefined && b > 0) {
+            /* 君主（Belong 指向自己）：他必须待在自己势力的城里，不在就是错列 */
+            var isKing = (pid + 1 === b);
+            if (isKing) {
+                for (k = 0; k < list.length; k++) {
+                    if (cities[list[k]] && cities[list[k]].Belong === b) { keeper = list[k]; break; }
+                }
+                if (keeper < 0) keeper = -1;                /* 君主：没有自己势力的城 → 后面专门处理 */
+            } else if (b !== WILD && b !== CAPTIVE && b !== undefined && b > 0) {
                 for (k = 0; k < list.length; k++) {
                     if (cities[list[k]] && cities[list[k]].Belong === b) { keeper = list[k]; break; }
                 }
             } else if (list.length) {
                 keeper = list[0];                        /* 在野/俘虏：保留首个 */
             }
-            if (keeper < 0) keeper = list[0];
-            /* 重复在册：只留 keeper */
-            for (k = 0; k < list.length; k++) {
-                if (list[k] === keeper) continue;
-                try { baye.deletePersonInCity(list[k], pid); } catch (e2) { }
-                fixed.push(nameOf(pid) + ' 重复在册（' + cityName(keeper) + '/' + cityName(list[k]) + '）');
+            /* 君主不在自己势力的任何城里 → 归位（若势力已灭就保留原状，绝不移出） */
+            if (isKing && keeper < 0) {
+                var oc0 = ownCities(b);
+                if (oc0.length) {
+                    for (k = 0; k < list.length; k++) {
+                        try { baye.deletePersonInCity(list[k], pid); } catch (e0) { }
+                    }
+                    placePerson(oc0[0], pid);
+                    fixed.push(nameOf(pid) + ' 君主归位（' + cityName(list[0]) + '→' + cityName(oc0[0]) + '）');
+                } else {
+                    /* 势力已灭：绝不移出城名册 —— 人一旦从所有名册消失就再也找不回来 */
+                    log(nameOf(pid) + ' 君主已无城可归，保留在' + cityName(list[0]));
+                }
+                continue;
             }
-            if (list.length > 1) continue;
-            /* 单一在册：检查归属是否与城池一致 */
+            if (keeper < 0) keeper = list[0];
+            /* 重复在册：只保留「自己势力的城」那一条。
+               注意 —— 只处理君主。普通武将出现在敌方城池是**合法状态**（出征/驻防/被俘），
+               强行删除会让人从名册消失（v1.13.4 前的 bug：把张济从晋阳删掉）。*/
+            if (isKing) {
+                for (k = 0; k < list.length; k++) {
+                    if (list[k] === keeper) continue;
+                    try { baye.deletePersonInCity(list[k], pid); } catch (e2) { }
+                    fixed.push(nameOf(pid) + ' 君主重复在册已清理（留' + cityName(keeper) + '）');
+                }
+                continue;
+            }
+            /* 普通武将：只观察不动手。引擎允许他驻扎在任意城（含敌方城池），
+               只有引擎自己结算后才会归位。我们擅自删= 让人消失。 */
+            if (list.length > 1) {
+                log(nameOf(pid) + ' 在' + list.map(cityName).join('/') + ' 多处（归属'
+                    + safeName(b) + '）· 引擎自行结算，��脚本不动');
+                continue;
+            }
+            /* 单一在册：君主不在自己势力的城里 → 归位（势力已灭则保留原状） */
             if (b === WILD || b === CAPTIVE || b === undefined || b <= 0) continue;
             if (cities[keeper] && cities[keeper].Belong === b) continue;
             if (pid + 1 === b) {
@@ -1139,23 +1263,15 @@
                     placePerson(oc[0], pid);
                     fixed.push(nameOf(pid) + ' 君主归位（' + cityName(keeper) + '→' + cityName(oc[0]) + '）');
                 } else {
-                    try { baye.deletePersonInCity(keeper, pid); } catch (e4) { }
-                    fixed.push(nameOf(pid) + ' 君主无城可归，已移出 ' + cityName(keeper));
+                    /* 势力已灭的君主：绝不能移出城名册 —— 人一旦从所有城池名册里消失，
+                       就再也找不回来了（引擎只在名册里存武将）。宁可让他留在城里被俘/当在野。*/
+                    log(nameOf(pid) + ' 君主已无城可归，保留在' + cityName(keeper));
                 }
                 continue;
             }
-            /* 普通武将错列：引擎若在别处也登记了他，以那边为准；否则视为中间态，不动 */
-            var home = -1, c2;
-            for (c2 = 0; c2 < cities.length; c2++) {
-                if (c2 === keeper || !cities[c2] || cities[c2].Belong !== b) continue;
-                if (personsOfCity(c2).indexOf(pid) >= 0) { home = c2; break; }
-            }
-            if (home >= 0) {
-                try { baye.deletePersonInCity(keeper, pid); } catch (e5) { }
-                fixed.push(nameOf(pid) + ' 错列于' + cityName(keeper) + '，已移出该城名册');
-            } else {
-                fixed.push(nameOf(pid) + ' 暂留' + cityName(keeper) + '（归属' + safeName(b) + '，等引擎结算）');
-            }
+            /* 普通武将单独出现在一座不属于自己的城里：可能是出征/驻防/刚被俘，
+               引擎自己会结算。我们**不动**（v1.13.4 前会删掉，导致武将人间蒸发）。*/
+            log(nameOf(pid) + ' 在' + cityName(keeper) + '（归属' + safeName(b) + '）· 引擎自行结算');
         }
         if (fixed.length) {
             pushReport('【名册】' + fixed.slice(0, 3).join('；') + (fixed.length > 3 ? ' 等' + fixed.length + '处' : ''));
@@ -1357,7 +1473,7 @@
                 if (!atkKing0) atkKing0 = cityName(fp.CityIndex) + '来军';
                 var defKing0 = safeName(cityAt(fp.CityIndex) && cityAt(fp.CityIndex).Belong) || cityName(fp.CityIndex);
                 if (!defKing0) defKing0 = cityName(fp.CityIndex) || '守方';
-                pushReport('【战】' + atkKing0 + '军 ' + attackSrcTag(fp) + '进攻 ' + cityName(fp.CityIndex)
+                pushReport('【战斗】' + atkKing0 + '军 ' + attackSrcTag(fp) + '进攻 ' + cityName(fp.CityIndex)
                     + '（' + defKing0 + '军），' + (win ? '城破' : '击退') + oddAttackTag(fp));
             } catch (e) { log('托管战报异常', e); }
 
@@ -1436,7 +1552,7 @@
                 var res = baye.data.g_FgtOver === FGT_WON ? '城破' : '击退';
                 battleRosters.push({ city: fp.CityIndex, pids: pids, month: monthKey(), result: baye.data.g_FgtOver });
                 /* 战斗当场就写月报，每场都记（不等月末，避免一个月只留最后一场） */
-                pushReport('【战】' + atkKing + '军 ' + attackSrcTag(fp, atkPid) + '进攻 ' + cityName(fp.CityIndex)
+                pushReport('【战斗】' + atkKing + '军 ' + attackSrcTag(fp, atkPid) + '进攻 ' + cityName(fp.CityIndex)
                     + '（' + defKing + '军），' + res + oddAttackTag(fp, atkPid));
             }
         } catch (e) { log('战斗记录异常', e); }
@@ -1636,6 +1752,9 @@
 
     function onTacticStage1() {
         try { forgeHookSelfHeal(); } catch (e) { }
+        /* 资源防截断：此刻引擎上个月的月结已跑完，钱被削到了 30000。
+           与上月末记录的额度对比，若确认是被削（非玩家自己花掉）就补回。*/
+        try { restoreResIfClamped(); } catch (e) { }
         var notes = [];
         if (appliedOnce) {
             if (flag('noDeathRescue')) {
@@ -1646,6 +1765,12 @@
             try { repairCityRoster(false); } catch (e) { }
         }
         applyEngineSwitches();
+        /* 资源补正放在月末（tacticStage5 末尾）做：引擎的月结
+           Money = 1 + Money + Commerce/2.5 并夹到 30000 发生在本钩子之后，
+           放在月初补会被随后的月结立刻削掉（实测 30175 → 30000 就是这个原因）。*/
+        /* 投奔/灾害的差分要在 snapshot() 覆盖之前做 */
+        try { if (appliedOnce) reportDefectionsAndDisasters(); } catch (e) { log('事件记录异常', e); }
+        try { snapshotBelong(); } catch (e) { }
         try { if (flag('noDeath') || flag('noDeathRescue')) snapshot(); } catch (e) { }
         /* 防灾：己方城池不出饥荒/旱灾/水灾/暴动（提防灾值 + 清当前状态） */
         try {
@@ -1767,7 +1892,7 @@
                 var tid = baye.data.g_GoodsQueue[slot] & 0x7fff;
                 baye.data.g_GoodsQueue[slot] |= 0x8000;      /* 引擎 SetGoods 同款：置已发现 */
                 say2(person, '此番搜寻，得了 ' + gbkSafe(baye.getToolName(tid)) + '！');
-                pushReport('【搜】发现 ' + gbkSafe(baye.getToolName(tid)) + '（' + cityName(city) + '）');
+                log('搜寻发现 ' + gbkSafe(baye.getToolName(tid)) + '（' + cityName(city) + '）');
                 got = true;
             }
         }
@@ -1780,7 +1905,7 @@
                 tp.Belong = king;
                 tp.Devotion = 70 + rand(30);
                 say2(t, '得遇明主，愿效犬马之劳！');
-                pushReport('【搜】' + nameOf(t) + ' 在' + cityName(city) + '出仕');
+                log('搜寻：' + nameOf(t) + ' 在' + cityName(city) + '出仕');
                 got = true;
             }
         }
@@ -1809,7 +1934,8 @@
         T.Devotion = 90;
         try { placePerson(city, person); } catch (e) { }    /* 执行者回城 */
         say2(ob, '愿降！从今往后，万死不辞！');
-        pushReport('【降】' + nameOf(ob) + ' 归顺 ' + safeName(P.Belong));
+        pushReport('【投奔】' + safeName(city.Belong) + '军 ' + nameOf(ob) + ' 投奔 ' + safeName(P.Belong)
+            + '（' + cityName(city) + '）');
         return 0;
     }
 
@@ -1825,7 +1951,8 @@
         T.Devotion = 40 + rand(40);
         try { placePerson(city, person); } catch (e) { }    /* 执行者回城 */
         say2(ob, '良禽择木而栖，愿随明主！');
-        pushReport('【揽】' + nameOf(ob) + ' 转投 ' + safeName(P.Belong) + '（' + cityName(city) + '）');
+        pushReport('【投奔】' + safeName(city.Belong) + '军 ' + nameOf(ob) + ' 投奔 ' + safeName(P.Belong)
+            + '（' + cityName(city) + '）');
         return 0;
     }
 
@@ -1896,6 +2023,29 @@
     }
     /* 最近一次进攻「目标城 → 出发城」台账：写出征单时记下，月报战报里回显「自 XX 进攻」 */
     var ATTACK_SRC = {};
+    /* 本月智慧引擎排出的出征单，月末核对结果：
+       【征】是「决定出兵」，【战】才是「打完了」。两者对不上时（引擎延后执行、
+       或这一仗没打成）要说清楚，否则玩家会以为出征没有结果。 */
+    var PENDING_SORTIE = [];
+    function checkSortieResults() {
+        if (!PENDING_SORTIE.length) return [];
+        var mk = monthKey(), out = [], i, s, hit = false, b;
+        for (i = 0; i < PENDING_SORTIE.length; i++) {
+            s = PENDING_SORTIE[i];
+            if (s.month !== mk) continue;
+            hit = false;
+            for (b = 0; b < battleRosters.length; b++) {
+                if (battleRosters[b].city === s.target && battleRosters[b].month === mk) { hit = true; break; }
+            }
+            if (!hit) out.push('攻' + cityName(s.target) + '（自' + cityName(s.src) + '）');
+        }
+        PENDING_SORTIE = [];
+        if (out.length) {
+            log('本月未见战果：' + out.join('、') + '（引擎延后执行或该仗未打成）');
+            return [];
+        }
+        return [];
+    }
     function noteAttackSrc(target, srcCity) {
         ATTACK_SRC[target] = { city: srcCity, month: monthKey() };
     }
@@ -1903,15 +2053,30 @@
        引擎自己发起的进攻则退而用攻方主帅当前所在城。 */
     function attackSrcTag(fp, atkPid) {
         try {
-            if (!fp) return '';
-            var rec = ATTACK_SRC[fp.CityIndex];
+            if (!fp) return '自 未知 ';
+            var tgt = fp.CityIndex;
+            /* ① 我们自己写单时记下的 */
+            var rec = ATTACK_SRC[tgt];
             if (rec && rec.month === monthKey()) return '自 ' + cityName(rec.city) + ' ';
+            /* ② 引擎指令队列里攻这座城的单（引擎 AI 主动出击也会写单，能查到出发城） */
+            try {
+                var q = baye.data.g_OrderQueue, i;
+                for (i = q.length - 1; i >= 0; i--) {
+                    if (q[i] && q[i].OrderId === 27 && q[i].Object === tgt && q[i].City !== undefined
+                        && q[i].City !== tgt) {
+                        return '自 ' + cityName(q[i].City) + ' ';
+                    }
+                }
+            } catch (e2) { }
+            /* ③ 攻方主帅此刻所在城（兜底） */
             var pid = (atkPid !== undefined && atkPid >= 0) ? atkPid : (fp.GenArray[0] ? fp.GenArray[0] - 1 : -1);
-            if (pid < 0) return '';
-            var from = cityOfPerson(pid);
-            if (from === 0xff) return '';
-            return '自 ' + cityName(from) + ' ';
-        } catch (e) { return ''; }
+            if (pid >= 0) {
+                var from = cityOfPerson(pid);
+                if (from !== 0xff) return '自 ' + cityName(from) + ' ';
+            }
+            /* ④ 行军途中/已撤离，出发城无从查证 —— 写「未知」保持格式统一 */
+            return '自 未知 ';
+        } catch (e3) { return '自 未知 '; }
     }
 
     function aiOccupyEmptyCities() {
@@ -1944,7 +2109,7 @@
                 city.Belong = srcKing;
                 city.SatrapId = best + 1;
                 occupied++;
-                pushReport('【占】' + safeName(srcKing) + '军 ' + nameOf(best)
+                log('空城占领：' + safeName(srcKing) + '军 ' + nameOf(best)
                     + ' 进驻空城 ' + cityName(c) + '（原属 ' + cityName(srcCity) + ' 出兵）');
             }
         } catch (e) { log('攻占空城异常', e); }
@@ -2142,7 +2307,7 @@
             if (moved.length >= 12) break;                 /* 每月调兵上限，避免天下大搬家 */
         }
         if (moved.length) {
-            out.push('【回防】' + safeName(king) + '军 ' + moved.slice(0, 4).join('、')
+            log('回防：' + safeName(king) + '军 ' + moved.slice(0, 4).join('、')
                 + (moved.length > 4 ? ' 等 ' + moved.length + ' 人' : ''));
         }
         refresh();                                          /* 调兵后重新评估 */
@@ -2187,7 +2352,9 @@
                 sortie++;
                 gens[c] = gl.slice(team.length);            /* 已编入军团，不再算守军 */
                 guard[c] = cityGuardPower(c, king);
-                out.push('【征】' + safeName(king) + '军 自 ' + cityName(c)
+                /* 记下目标，用于月末核对「出征后是否真的打了这一仗」 */
+                PENDING_SORTIE.push({ target: bestT, src: c, month: monthKey() });
+                log('出征：' + safeName(king) + '军 自 ' + cityName(c)
                     + ' 出兵 ' + team.length + ' 将 攻 ' + cityName(bestT));
             }
         }
@@ -2281,7 +2448,7 @@
             /* 读档：强化是长期投入，只校验槽位道具名是否还对得上（换档后自动丢弃失效记录） */
             forgeValidate();
         }
-        PENDING_PLACE = {};            /* 待归位君主 */
+        PENDING_PLACE = {}; PENDING_SORTIE = []; BELONG_SNAP = null; DISASTER_SNAP = null;            /* 待归位君主 */
         ATTACKED.month = ''; ATTACKED.targets = {};
         ATTACK_SRC = {};                /* 进攻出发城台账 */
         log('已重置本局运行数据（月报/台账/跟踪基线' + (isNewGame ? '，强化记录已清空' : '') + '）');
@@ -2319,6 +2486,8 @@
         try { notes = notes.concat(flushPendingPlace(false) || []); } catch (e) { log('君主归位异常', e); }
         /* 必须在 lib 的 tacticStage5「敌方俘虏入城」之前把君主放回去 ——
            wrapHook 先跑本函数再跑原钩子，正好卡在这个位置。 */
+        /* 先记下月结前的资源值：引擎这一步会把超过 30000 的部分夹掉，
+           记下来才能在下月初把差额结转回去（真·解除上限） */
         try { notes = notes.concat(rollbackCapturedKings(false) || []); } catch (e) { log('君主回滚异常', e); }
         /* 战死概率抽取（倍率>0 时）+ 阵亡检测 */
         try {
@@ -2328,8 +2497,25 @@
         } catch (e) { log('阵亡检测异常', e); }
         /* 资源包：一夜暴富 / 道具全收 / 经验注入（月结时统一执行并记月报） */
         try { notes = notes.concat(monthlyBoon() || []); } catch (e2) { log('资源包异常', e2); }
+        /* 出征结果核对：【征】是决定出兵，【战】才是结果；对不上要说明 */
+        try { notes = notes.concat(checkSortieResults() || []); } catch (e3) { }
         if (notes.length) pushReport(notes);
+        /* 资源补正：引擎的月结（Money=1+Money+Commerce/2.5 并夹到 30000）跑在所有钩子之后，
+           所以这里补等于白补。延迟到月结完成后再写 —— 这是「30175 又变回30000」的真正原因。 */
+        if (flag('noResCap')) {
+            /* 在「钱还没被引擎削」的时刻记下每座城的额度。
+               引擎月结跑在所有钩子之后 → 真正的恢复放到下月 tacticStage1。*/
+            recordResBase();
+        }
         return undefined;
+    }
+    function resMoneySnapshot() {
+        var mine = ownCities((baye.data.g_PlayerKing || 0) + 1), m = {}, i;
+        for (i = 0; i < mine.length; i++) {
+            var city = cityAt(mine[i]);
+            if (city) m[mine[i]] = Number(city.Money) || 0;
+        }
+        return m;
     }
 
     /* ======================== 6. 需求2：菜单功能 ========================
@@ -2371,8 +2557,9 @@
         return 0;         /* 0 = 已处理；原版帮助通过最后一项进入 */
     }
 
+    /* 月报：只列记录，不加说明（玩家要的是简洁，看不懂说明说明程序有问题） */
     function showMonthReport() {
-        menu(info.monthReport.length ? info.monthReport : ['（暂无记录，每月月初与月末会自动记录）']);
+        menu(info.monthReport.length ? info.monthReport : ['（暂无记录）']);
     }
 
     /* 每行别超过 30 个半角（引擎会把超宽行自动折行，列表会乱） */
@@ -2667,10 +2854,10 @@
         if (TRACK.names.length) {
             var gone = diff(TRACK.names, names), add = diff(names, TRACK.names);
             var openCity = diff(TRACK.inCity, inCity), moveCity = diff(inCity, TRACK.inCity);
-            if (gone.length) out.push('【本月消失】' + briefList(gone, 10));
-            if (add.length) out.push('【新增】' + briefList(add, 10));
-            if (openCity.length) out.push('【离开】' + briefList(openCity, 6));
-            if (moveCity.length) out.push('【迁入】' + briefList(moveCity, 6));
+            if (gone.length) log('武将跟踪·本月消失：' + briefList(gone, 10));
+            if (add.length) log('武将跟踪·新增：' + briefList(add, 10));
+            if (openCity.length) log('武将跟踪·离开：' + briefList(openCity, 6));
+            if (moveCity.length) log('武将跟踪·迁入：' + briefList(moveCity, 6));
         } else {
             out.push('（首次记录基线，下月起可查看变化）');
         }
@@ -2768,32 +2955,39 @@
        4) 只强化「装备类」道具（useflag=0），消耗品（useflag=1）不参与。 */
 
     var FORGE_KEY = 'baye_cheat_forge_v1';      /* 旧键（仅用于一次性迁移） */
-    /* 强化不设上限（用户需求）。这里只是「读档容错」用的软顶 —— 正常永远不会碰到，
-       因为费用按1.3 次幂增长，到 +100 已经是天文数字，曲线本身就把等级锁死在 +15~20 区间。
-       伤害系数走饱和曲线（见 forgeDmgMul），高等级自动收敛到上限，不会无限膨胀。 */
-    var FORGE_MAX = 999;
-    /* 费用基准：对齐引擎真实经济 —— 城市金币上限 30000（Money>30000 截断），
-       月自动收入 = Commerce×0.05（单城约 10 金，全势力 100~300 金）。
-       基准 30 + 1.3 次幂（稀有度 2 的普通兵器）：
-         单次 60 → 1684 金，单次始终在单城上限内；
-         满级期望总花费约 2.8 万金 ≈ 184 个月（15 年游戏内时间），
-         +3 只要 3 个月、+7 约 32 个月，阶梯清晰、不会一步登天。 */
-    var FORGE_BASE_COST = 30;
-    var FORGE_COST_POW = 1.3;
-    /* 高阶保护：达到此等级后失败不再掉级（DNF「强化保护券」的简化版）。
-       没有它的话，「低成功率 + 失败掉一级」会变成随机游走 ——
-       蒙特卡洛实测期望花费高达 597 万金（2.7 万个月），等于永远打不到 +13。 */
-    var FORGE_SAFE_LV = 8;
-    /* 伤害曲线的收敛点：+30 之后 mul 已经无限逼近 FORGE_DMG_CAP，
-       所以再往上强化对伤害毫无收益（纯粹烧钱），这也顺手防了数值溢出。 */
-    var FORGE_SOFT_CAP = 30;
-    var FORGE_DMG_CAP = 0.55;      /* 伤害加成上限（+13 约 +55%） */
-    var FORGE_DMG_K = 6.5;
-    var FORGE_DMG_K1 = 1.0;
+    /* ================= 强化系统 v2.0 =================
+       参考 DNF / 梦幻 / 天牢的成熟设计。旧 v1 的三个致命问题：
+         ① 饱和曲线 FORGE_DMG_CAP=0.55 → +13 之后 mul 无限逼近 0.55，
+            再强化**收益为 0**但费用照涨 → 高投入零回报；
+         ② 费用 1.3 次幂 → 冲到 +20 单次要几万金，单城放不下（引擎截断），理论不可达；
+         ③ 等级名义无上限（999）但曲线收敛 = 永远看不到头的坑。
 
-    /* 等级 → 升到下一级的成功率（%）。0~4 保底易得，5~9 明显变难，10+ 噩梦区。
-       超出数组长度时沿用最后一项（9%）—— 等级不设上限，所以这里必须有兜底。 */
-    var FORGE_RATE = [100, 100, 95, 90, 82, 70, 60, 50, 40, 32, 24, 18, 13, 9];
+       v2 的四个原则：
+         · 边际递减但**永不归零**：每级固定增量 + 等级二次修正，高投入永远有回报；
+         · 费用落在可承受区间：单次封顶 = 单城金币上限（30000），不会出现"钱不够"；
+         · +20 是效率拐点而非硬墙：之后仍可强化，但每级收益明显下降，由玩家决定停手；
+         · 难度阶梯 + 连败保底 + 高阶失败保护，避免无限掉级。
+
+       经济基准（引擎真实数值）：单城金币上限 30000，月入≈ Commerce×0.05 ≈ 10 金。 */
+
+    var FORGE_MAX = 20;              /* 硬上限 */
+    var FORGE_SOFT_CAP = 20;         /* 效率拐点：+20 后每级收益明显下降 */
+
+    var FORGE_BASE_COST = 40;        /* +1 的费用（普通兵器，稀有度 1.0） */
+    var FORGE_COST_RATIO = 1.30;     /* 每级费用倍率（+20 约 190 倍） */
+    var FORGE_COST_MAX = 30000;      /* 单次费用封顶 = 单城金币上限，绝不出现"钱不够" */
+
+    /* 收益：mul(lv) = 1 + lv × FORGE_STEP × (1 + FORGE_GROWTH × lv)
+       +1:×1.05  +5:×1.32  +10:×1.78  +15:×2.37  +20:×3.10（+210%）  +30:×3.45
+       每级增量缓慢变小，但**永不归零** —— 高投入永远有回报。 */
+    var FORGE_STEP = 0.05;           /* 每级基础增量 5% */
+    var FORGE_GROWTH = 0.055;        /* 等级的二次修正（让高等级更值钱） */
+    var FORGE_MUL_CAP = 4.5;         /* mul 上限，防数值溢出（+30 时才 3.45，安全余量） */
+
+    /* 难度阶梯：+1~+4 保底易得，+15 以后是噩梦区（4%）。 */
+    var FORGE_SAFE_LV = 10;          /* 达到此级后失败不降级 */
+    var FORGE_PITY_STREAK = 8;       /* 连败 8 次后下一次必成 */
+    var FORGE_RATE = [100, 100, 96, 92, 86, 78, 70, 62, 54, 46, 38, 31, 25, 20, 16, 13, 10, 8, 6, 5, 4];
     function forgeRateAt(lv) { return FORGE_RATE[Math.min(lv, FORGE_RATE.length - 1)]; }
 
     /* FORGE[槽位键] = { lv: 等级, fail: 连败次数, name: 道具名 } */
@@ -2853,11 +3047,16 @@
     }
 
     /* 伤害系数：饱和曲线，见文件头「设计要点 2」 */
+    /* 等级 → 战力倍率。边际递减但**永不归零**：高投入永远有回报。 */
     function forgeDmgMul(lv) {
         if (!lv || lv <= 0) return 1;
-        if (lv > FORGE_SOFT_CAP) lv = FORGE_SOFT_CAP;   /* 曲线收敛用，与等级上限无关 */
-        var x = lv / (lv + FORGE_DMG_K);
-        return 1 + FORGE_DMG_CAP * x / FORGE_DMG_K1;
+        if (lv > FORGE_SOFT_CAP) {
+            /* 拐点之后：每级只给 1/3 的收益，仍在增长，但明显该收手了 */
+            var base = FORGE_SOFT_CAP * FORGE_STEP * (1 + FORGE_GROWTH * FORGE_SOFT_CAP);
+            var extra = (lv - FORGE_SOFT_CAP) * (base / FORGE_SOFT_CAP) / 3;
+            return Math.min(FORGE_MUL_CAP, 1 + base + extra);
+        }
+        return Math.min(FORGE_MUL_CAP, 1 + lv * FORGE_STEP * (1 + FORGE_GROWTH * lv));
     }
 
     /* 该武将身上所有已强化装备的合成系数（多件不叠加，取最高的一件）——
@@ -2927,19 +3126,22 @@
         return 1 + Math.min(1.2, sum / 20);
     }
 
-    /* 升到 lv+1 的费用 */
+    /* 升到 lv+1 的费用。等比数列（1.28^lv），封顶在单城金币上限。
+       +1 约 40金 → +10 约 340金 → +20 约 5000金（名品再乘稀有度系数）。 */
     function forgeCost(lv, rarity) {
         if (rarity <= 0) return 0;
-        /* 等级不设上限，费用按 1.3次幂自然涨到「不可能达到」，
-           曲线本身就取代了硬上限的作用。Math.pow 溢出时兜底成 Infinity。 */
-        var v = FORGE_BASE_COST * rarity * Math.pow(lv + 1, FORGE_COST_POW);
-        if (!isFinite(v)) return 1e12;
-        return Math.round(v > 1e12 ? 1e12 : v);
+        var v = FORGE_BASE_COST * rarity * Math.pow(lv + 1, FORGE_COST_RATIO);
+        if (!isFinite(v) || v > FORGE_COST_MAX) return FORGE_COST_MAX;
+        return Math.round(v);
     }
 
-    /* 升到 lv+1 的成功率（含保底） */
+    /* 升到 lv+1 的成功率（含保底）。经典设计：
+       · 必定成功开关（作弊）直接 100%；
+       · 连败达 FORGE_PITY_STREAK 次后下一次必成（保底，避免高等级无限掉级）；
+       · 否则按等级阶梯。 */
     function forgeRate(lv, failStreak) {
         if (flag('forgeGuarantee')) return 100;      /* 必定成功开关 */
+        if (failStreak >= FORGE_PITY_STREAK) return 100;   /* 连败保底 */
         if (flag('forgePity') && failStreak >= 5) return 100;
         return forgeRateAt(lv);
     }
@@ -2963,7 +3165,7 @@
         var key = forgeKey(pid, slot);
         var rec = FORGE[key] || { lv: 0, fail: 0, name: '' };
         var lv = rec.lv, rate = forgeRate(lv, rec.fail), cost = forgeCost(lv, rarity);
-        if (lv >= FORGE_MAX) return { ok: false, msg: '已达读档容错上限' };
+        if (lv >= FORGE_MAX) return { ok: false, msg: '已达强化上限 +' + FORGE_MAX + '（可在设置里调高）' };
         if (rate <= 0) return { ok: false, msg: '成功率异常' };
 
         /* 扣钱：玩家势力任意一座城的 Money 合计（铁匠铺视为向都城支取） */
@@ -3254,7 +3456,8 @@
             '资源管理',
             '',
             '都城 ' + capName + '　势力金币合计 ' + purse + '（' + my.length + ' 座城'
-                + (full ? '，其中 ' + full + ' 座已满' : '') + '，单城上限 ' + MONEY_SOFT_CAP + '）',
+                + (full ? '，其中 ' + full + ' 座已满' : '') + '）',
+            '金币每月加多少：' + (Number(cfg.richAmount) || 3000) + '（与粮草同一个额度）',
             '己方武将 ' + ids.length + ' 名　等级上限 ' + MAX,
             ''
         ];
@@ -3262,15 +3465,31 @@
         var acts = {};
         function addAct(label, fn) { acts[lines.length] = fn; lines.push(label); }
         addAct('【1】立即加钱（君主所在城）', function () { doRich(false, true); });
-        addAct('【2】全员加经验 +30', function () { boostExperience(30, false, false); });
-        addAct('【3】全员加经验 +100', function () { boostExperience(100, false, false); });
-        addAct('【4】一键满级（全员 ' + MAX + ' 级）', function () { levelUpAll(false, false); });
-        addAct('【5】获取全部道具（一次性）', function () { giveAllTools(false); });
+        addAct('【2】立即加粮（君主所在城）', function () { doFood(false, true); });
+        addAct('【3】把金币补到上限（手动）', function () {
+            var mine2 = ownCities((baye.data.g_PlayerKing || 0) + 1), did = [];
+            for (var i2 = 0; i2 < mine2.length; i2++) {
+                var ct2 = cityAt(mine2[i2]);
+                if (!ct2) continue;
+                var before2 = Number(ct2.Money) || 0;
+                if (before2 >= 65535) continue;
+                ct2.Money = 65535;
+                RES_LAST[mine2[i2]] = Number(ct2.Money) || 0;
+                did.push(cityName(mine2[i2]) + ' ' + before2 + '→' + (Number(ct2.Money) || 0));
+            }
+            alert2(did.length ? ('已补到上限：\n' + did.join('\n')) : '所有己方城池都已经是 65535 了。');
+        });
+        addAct('【3】全员加经验 +30', function () { boostExperience(30, false, false); });
+        addAct('【4】全员加经验 +100', function () { boostExperience(100, false, false); });
+        addAct('【5】一键满级（全员 ' + MAX + ' 级）', function () { levelUpAll(false, false); });
+        addAct('【6】获取全部道具（一次性）', function () { giveAllTools(false); });
         lines.push('');
-        lines.push('每月自动：' + (flag('richMode') ? '加钱 ' : '关')
-            + ' / ' + (flag('allTools') ? '道具' : '关')
-            + ' / ' + (flag('levelBoost') ? '经验' : '关'));
-        lines.push('长期开关：' + (flag('levelBoostAll') ? '读档即满级' : '关'));
+        lines.push('【每月自动执行】加钱：' + (flag('richMode') ? '开' : '关') + '　道具投放：' + (flag('allTools') ? '开' : '关')
+            + '　加经验：' + (flag('levelBoost') ? '开' : '关'));
+        lines.push('【资源】' + (flag('noResCap') ? '防截断已开（引擎削到 30000 时自动补回）'
+            : '防截断已关（引擎每月削到 30000）'));
+        lines.push('【读档时自动】全员满级：' + (flag('levelBoostAll') ? '开' : '关')
+            + '　（以上都可在面板对应开关里调整；本菜单的即时功能不依赖它们）');
         menu(lines, 0, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) return;
             /* 这五个函数内部已自带 alert（silent=false），不要再叠加一次弹窗。 */
@@ -3323,11 +3542,11 @@
     var MONEY_SOFT_CAP = 30000;
     var MONEY_CAP_PROBED = 0;          /* 已知的引擎实测上限（0=未知） */
 
+    /* 上限只由「实测校准」决定：cfg.moneyCap 已从面板移除，
+       早期版本手填的测试值（如 66666）不该继续影响发钱。 */
     function effMoneyCap() {
-        var manual = Number(cfg.moneyCap) || 0;
-        if (manual > 0) return manual;
         if (MONEY_CAP_PROBED > 0) return MONEY_CAP_PROBED;
-        return MONEY_SOFT_CAP;
+        return RES_CAP_MONEY;
     }
 
     /* 给单座城加钱（写后回读校准）。返回 { got, before, after, capped } */
@@ -3377,6 +3596,206 @@
        都城优先，都城满了自动接着给其他己方城池（v1.11.5：以前只给都城一座，
        都城一旦到上限就几乎加不进去，用户看到的就是「只+1」）。
        汇报时逐城列出 before→after，并明确告知是否有剩余没发出去。 */
+    /* ---------- 资源上限：真·跨月结转（v1.12.3） ----------
+       查引擎源码后的结论（baye.wasm 反汇编）：
+       ① 30000 是引擎硬编码，lib 脚本与 g_engineConfig 里都没有这个参数，脚本层改不了；
+       ② 它出现在**月结流程**（function #351，8908 字节）里，形式是先 `& 0xFFFF` 再与 30000 比较，
+          所以钳制发生在月结那一步，不是每次赋值 —— 月中持有超过 3 万是可能的，
+          但月结会被夹回 30000，超出部分直接消失。
+       因此「解除上限」的正确做法不是每月补到 3 万（那确实只是当月随便花），
+       而是：月结前记下被吞掉的差额 → 下月初连本带利补回去，实现跨月结转。
+       上限取 65535：引擎内部多处 `& 0xFFFF`（16 位运算），
+       Money/Food 超过 65535 会让那些判断看到错值，所以结转封顶在 65535（=30000+35535）。
+       能不能真的存下 >30000 由引擎决定（字段本身可能不钳制）→ 首次运行时自动实测：
+       写 65535 读回，若读回仍是 65535 → 结转生效；被夹回 30000 → 退化为「每月补满」。 */
+    /* 金币：实测字段可存到 65535（写 65535/60000/45000/30001 均成功，只有 >65535 被截）。
+       30000 只是引擎「月结」时的夹断，月初补回即可绕过 → 目标值设为 65535。*/
+    var RES_CAP_MONEY = 65535, RES_CAP_FOOD = 0;    /* 粮草 0 = 未探测 */
+    var RES_WRITE_MAX = 0;                          /* 实测：字段能存的最大值（0=未知） */
+    var warnedCapOff = 0;                           /* 关着开关时的提示只弹一次 */
+    var RES_SNAP = {};                              /* 城号 -> 月结前的 Money/Food */
+    var RES_CARRY = {};                             /* 城号 -> 已结转的 Money/Food */
+    /* 每座城最近一次的金币额度：用来判断「这笔钱是被引擎削的，还是我自己花掉的」。
+       被削 → 钱恰好停在 30000；自己花 → 各种零散数字，不会正好是 30000。 */
+    var RES_LAST = {};
+    function resState(c) {
+        if (!RES_CARRY[c]) RES_CARRY[c] = { money: 0, food: 0 };
+        return RES_CARRY[c];
+    }
+    /* 首次运行时实测字段能否存下 >30000（写 65535 读回，再还原） */
+    function probeResWriteCeiling(city) {
+        if (RES_WRITE_MAX) return RES_WRITE_MAX;
+        try {
+            var om = Number(city.Money) || 0, of = Number(city.Food) || 0;
+            city.Money = 65535;
+            var backM = Number(city.Money) || 0;
+            city.Money = om;
+            if (!RES_CAP_FOOD) RES_CAP_FOOD = probeResCap(city, 'Food', 60000) || 60000;
+            city.Food = 65535;
+            var backF = Number(city.Food) || 0;
+            city.Food = of;
+            RES_WRITE_MAX = Math.min(backM, backF);
+            if (RES_WRITE_MAX < 30001) {
+                log('实测：字段本身就把资源钳在 30000（写 65535 回读 ' + backM + '/' + backF
+                    + '），跨月结转不可用 → 退化为「每月补满到上限」');
+            } else {
+                log('实测：资源可存到 ' + RES_WRITE_MAX + '（引擎只在月结钳制）→ 跨月结转已启用');
+            }
+        } catch (e) { }
+        return RES_WRITE_MAX;
+    }
+    function probeResCap(city, field, guess) {
+        try {
+            var old = Number(city[field]) || 0;
+            var back = 0, g;
+            for (g = guess; g >= 500; g = Math.round(g / 2)) {
+                city[field] = g;
+                back = Number(city[field]) || 0;
+                if (back >= g) break;
+                if (g <= 500) break;
+            }
+            city[field] = Math.min(old, back || old);
+            return back;
+        } catch (e) { return 0; }
+    }
+    /* 月结（tacticStage5，引擎钳制之前）记下每座己方城的资源值 */
+    function snapshotResPreClamp() {
+        var mine = ownCities((baye.data.g_PlayerKing || 0) + 1), i, c, city;
+        for (i = 0; i < mine.length; i++) {
+            c = mine[i];
+            city = cityAt(c);
+            if (!city) continue;
+            RES_SNAP[c] = { money: Number(city.Money) || 0, food: Number(city.Food) || 0 };
+        }
+    }
+    /* 每月月初：把上月被引擎吞掉的差额结转回来 + 补满基线 */
+    /* 每月末（tacticStage5）记下每座己方城池的金币额度 —— 此刻引擎还没削，是真实值 */
+    function recordResBase() {
+        var mine = ownCities((baye.data.g_PlayerKing || 0) + 1), i, city;
+        for (i = 0; i < mine.length; i++) {
+            city = cityAt(mine[i]);
+            if (city) RES_LAST[mine[i]] = Number(city.Money) || 0;
+        }
+    }
+    /* 每月初（tacticStage1）：引擎月结已经跑完。
+       若某城金币「正好被削到 30000」且上月末记录过更高额度 → 判定被削，补回。
+       若上月末本来就只剩 30000（玩家自己花光的）→ 不补。 */
+    function restoreResIfClamped() {
+        if (!flag('noResCap')) return;
+        var mine = ownCities((baye.data.g_PlayerKing || 0) + 1), out = [], i, c, city, remember, curM;
+        for (i = 0; i < mine.length; i++) {
+            c = mine[i];
+            city = cityAt(c);
+            if (!city) continue;
+            remember = RES_LAST[c];
+            curM = Number(city.Money) || 0;
+            if (curM === 30000 && remember && remember > 30000) {
+                city.Money = remember;
+                var realM = Number(city.Money) || 0;
+                if (realM > 30000) {
+                    out.push(cityName(c) + ' 被削到 30000 → 补回 ' + realM);
+                } else {
+                    out.push(cityName(c) + ' 被削到 30000（补回失败，引擎只给 ' + realM + '）');
+                }
+            }
+            /* 粮草：只在被 %65536 绕回归零时补回 */
+            var curF = Number(city.Food) || 0;
+            if (curF <= 50) {
+                city.Food = 65535;
+                out.push(cityName(c) + ' 粮溢出归零 → 补回 ' + (Number(city.Food) || 0));
+            }
+        }
+        if (out.length) {
+            log('资源防截断：' + out.join('；'));
+        }
+    }
+
+    /* 资源防截断（v1.13.7）
+       引擎规则（已实测+源码反汇编）：金币字段能存 65535，但每月结算里
+       `Money = 1 + Money + Commerce/2.5` 会把超过 30000 的部分削掉。
+       脚本改不了引擎，只能事后补偿。但「补偿」≠「补满」——
+
+       ★ 关键区分（用户明确要求）★
+         · 被引擎削：钱从高位突然掉到 30000  → 补回差额
+         · 自己花钱：65535 → 50000 → 30000 这种平滑下降 → **绝不补**
+       所以必须记住「上次有多少钱」，只在检测到「钱被削到 30000」时补：
+
+         记LAST  = 上次结算后的钱（65535）
+         本月结算后 = 30000，若 30000 < LAST 且 差值很大 → 判定被削，
+         补回 LAST 的值；若 30000 正好等于玩家"自己能花到的水平"，
+         说明是正常消费，不补。
+
+       实际判据（简单可靠）：**只在钱恰好等于 30000 时补**，
+       因为玩家自己花钱几乎不会正好停在 30000 这个整数上。 */
+    /* 手动把金币补到上限（资源管理菜单的按钮用）。
+       自动的「被削就补」走 restoreResIfClamped，这里只负责你主动点一下。 */
+    function refillResources(verbose) {
+        var out = [], i, c, city;
+        var mine = ownCities((baye.data.g_PlayerKing || 0) + 1);
+        for (i = 0; i < mine.length; i++) {
+            c = mine[i];
+            city = cityAt(c);
+            if (!city) continue;
+            var curM = Number(city.Money) || 0;
+            if (curM >= 65535) continue;
+            city.Money = 65535;
+            var realM = Number(city.Money) || 0;
+            RES_LAST[c] = realM;                    /* 记为月末基准 */
+            out.push(cityName(c) + ' 金 ' + curM + '→' + realM);
+        }
+        if (verbose) alert2(out.length ? ('已补到上限：\n' + out.join('\n')) : '所有己方城池都已经是 65535 了。');
+        return out;
+    }
+
+    /* ---------- 立即加粮（v1.12.4） ----------
+       粮草与金币的溢出行为不同（引擎 WASM 反汇编结论）：
+         · 金币：月结 min(值,30000) 夹住 → 超出部分可恢复 → 可以跨月结转；
+         · 粮草：引擎对 Food 做 `& 0xFFFF`（等价 %65536）再写回 → 65536 恰好变成 0，
+                 超过 65535 的部分直接绕回、不可恢复。
+       所以粮草不做结转，只保证「永远不触发绕回」：每月补到 65535（16 位内的最大值）。 */
+    var FOOD_SAFE_MAX = 65535;
+    function setCityFood(city, want) {
+        if (!city) return { got: 0, before: 0, after: 0, capped: true };
+        var before = Number(city.Food) || 0;
+        if (before >= FOOD_SAFE_MAX) return { got: 0, before: before, after: before, capped: true };
+        var after = Math.min(FOOD_SAFE_MAX, before + want);
+        city.Food = after;
+        var real = Number(city.Food) || 0;
+        if (!isFinite(real) || real < 0) real = after;
+        /* 写多了会绕回（65536→0），这里必须夹回安全值 */
+        if (real > FOOD_SAFE_MAX || real < before) {
+            city.Food = Math.min(FOOD_SAFE_MAX, Math.max(before, real));
+            real = Number(city.Food) || 0;
+        }
+        return { got: real - before, before: before, after: real, capped: real < before + want };
+    }
+    function doFood(silent, force) {
+        if (!force && !flag('richMode')) return 0;
+        var c = capitalCity();
+        if (c < 0) { if (!silent) alert2('没有己方城池，无法增加粮草'); return 0; }
+        var want = Math.max(0, Math.round(safeWeight('richAmount', 3000)));
+        if (!want) { if (!silent) alert2('加粮数量为 0（可在金手指面板里改「暴富金额」）'); return 0; }
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var order = [c], i, list = ownCities(myKing);
+        for (i = 0; i < list.length; i++) if (list[i] !== c) order.push(list[i]);
+        var left = want, total = 0, notes = [];
+        for (i = 0; i < order.length && left > 0; i++) {
+            var r = setCityFood(cityAt(order[i]), left);
+            if (r.got > 0) {
+                total += r.got; left -= r.got;
+                RES_LAST[order[i]] = r.after;            /* 手动加的钱也算基准，别当成被削 */
+                notes.push(cityName(order[i]) + ' ' + r.before + '→' + r.after);
+            }
+        }
+        if (!silent) {
+            alert2('增加粮草 ' + total + '（计划 ' + want + '）\n'
+                + (notes.length ? notes.join('\n') : '（没有可加的城）')
+                + '\n粮草安全上限 ' + FOOD_SAFE_MAX + '（引擎对粮草做 %65536，超过会绕回 0，粮草不能跨月结转）'
+                + (left > 0 ? '\n⚠ 剩余 ' + left + ' 没能发放（后面的城也已满）' : ''));
+        }
+        return total;
+    }
+
     function doRich(silent, force) {
         if (!flag('richMode') && !force) return 0;   /* 资源管理菜单手动点击时 force=true，不依赖月度开关 */
         var c = capitalCity();
@@ -3395,12 +3814,11 @@
         if (!silent) {
             var capNow = effMoneyCap();
             var msg = '增加金钱 ' + total + '（计划 ' + want + '）\n'
-                + (notes.length ? notes.join('\n') : '（没有可加的城）')
-                + '\n单城上限 ' + capNow + (MONEY_CAP_PROBED ? '（实测值）' : '（默认，可探测）');
+                + (notes.length ? notes.join('\n') : '（没有可加的城）');
             if (total === 0 && want > 0) {
-                msg += '\n⚠ 一分钱都没加上：己方城池金币都已到引擎硬上限 —— 这是引擎的上限，'
-                    + '加多少都会被截断。可行办法：① 用「获取全部道具」换战力；② 提升商贸等内政让月入更���；'
-                    + '③ 若你确信上限不该这么低，点下面「重新探测上限」按钮';
+                msg += '\n金币到引擎硬上限 ' + RES_CAP_MONEY + ' 了，脚本加不进去（只能靠商贸月入）';
+            } else if (left > 0) {
+                msg += '\n还有 ' + left + ' 没发出去（后面的城也满了）';
             } else if (left > 0) {
                 msg += '\n⚠ 剩余 ' + left + ' 没能发放（后面的城也已满）—— 先花掉一些或把「暴富金额」调小';
             }
@@ -3552,10 +3970,8 @@
     /* ---------- 每月执行（挂在 tacticStage5 月末） ---------- */
     function monthlyBoon() {
         var notes = [];
-        try {
-            var got = doRich(true);
-            if (got > 0) notes.push('【富】' + cityName(capitalCity()) + ' 金币 +' + got);
-        } catch (e) { }
+        /* 每月自动加钱已移除（面板开关也删了）：加钱改成「想加多少就在资源管理里点一次」，
+           避免旧配置里残留的 richMode=1 每个月白送一笔。 */
         try {
             if (flag('allTools')) {
                 var n = giveAllTools(true);
@@ -3565,7 +3981,7 @@
         try {
             if (flag('levelBoost')) {
                 var k = boostExperience(30, false, true);
-                if (k > 0) notes.push('【等级】' + k + ' 名武将各 +30 经验');
+                if (k > 0) log('批量加经验：' + k + ' 名武将各 +30 经验');
             }
         } catch (e3) { }
         return notes;
@@ -3598,9 +4014,9 @@
         '  box-shadow:0 1px 3px rgba(0,0,0,.3);transition:left .18s}',
         '#bayeCheatDock .sw.on{background:#3ec26a}',
         '#bayeCheatDock .sw.on i{left:23px}',
-        '#bayeCheatDock .nums{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 0}',
-        '#bayeCheatDock .nums label{font-size:11.5px;color:#666;display:flex;align-items:center;gap:4px}',
-        '#bayeCheatDock .nums input{width:54px;padding:3px 5px;border:1px solid #dcdcdc;border-radius:6px;font-size:12px}',
+        '#bayeCheatDock .nums{display:flex;flex-direction:column;gap:6px;margin:6px 0 0}',
+        '#bayeCheatDock .nums label{font-size:12px;color:#555;display:flex;flex-direction:column;align-items:stretch;gap:4px;line-height:1.35}',
+        '#bayeCheatDock .nums input{width:100%;min-width:0;box-sizing:border-box;padding:5px 7px;border:1px solid #dcdcdc;border-radius:6px;font-size:12.5px}',
         '#bayeCheatDock .fn{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}',
         '#bayeCheatDock .fn button{flex:1;min-width:84px;padding:7px 8px;border:1px solid #e0e0e0;background:#fafafa;',
         '  border-radius:8px;font-size:12.5px;cursor:pointer;color:#333}',
@@ -3613,6 +4029,8 @@
         '#bayeCheatDock .sm.on{background:#3ec26a;border-color:#3ec26a;color:#fff;font-weight:600}',
         '#bayeCheatDock .slot{flex:1;min-width:52px;padding:7px 6px;border:1px solid #e0e0e0;background:#fafafa;border-radius:8px;font-size:12.5px;cursor:pointer;color:#333}',
         '#bayeCheatDock .slot.on{background:#3ec26a;border-color:#3ec26a;color:#fff;font-weight:600}',
+        '#bayeCheatDock .slot.live{box-shadow:0 0 0 2px #3ec26a inset;color:#2c7a4b;font-weight:600}',
+        '#bayeCheatDock .slot.on.live{color:#fff}',
         '#bayeCheatDock .bind{flex:1;min-width:74px;padding:7px 6px;border:1px dashed #bcd8c4;background:#f4fbf6;border-radius:8px;font-size:12px;cursor:pointer;color:#2c7a4b}',
         '#bayeCheatDock .bind:hover{background:#e8f6ee}',
         '#bayeCheatDock .tip{font-size:11px;color:#a0a0a0;margin-top:8px;line-height:1.5}',
@@ -3628,15 +4046,11 @@
         { k: 'autoBalance', t: 'AI 托管战斗加权结算', d: '武将战力×兵力×城防×战场地形加权，替代原版「只比总兵力」，杜绝一将挡八将' },
         { k: 'engineSettle', t: '托管战斗交还引擎结算', d: '默认关。开启后 AI 之间的战斗完全按引擎原版流程结算（战斗动画里的「双 VS」重叠即由此开关验证）；代价是这类战斗不再记入月报/参战名单，也不在战场抢救君主' },
         { k: 'noDisaster', t: '城池无灾害', d: '默认关闭（尊重原机制）。开启后每月把己方城池防灾值拉满并清除已有的饥荒/旱灾/水灾/暴动' },
+        { k: 'noResCap', t: '资源防截断', d: '默认开启。引擎每月结算会把金币削到 30000；本项只在检测到「被削到 30000」时补回原额度（你自己花掉的钱不会补）。粮草被引擎溢出归零时也会补回' },
         { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（等级不设上限），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
         { k: 'forgePity', t: '强化保底', d: '默认开启。连续失败 5 次后下一次必定成功，避免高等级陷入无限掉级（+11 以上成功率仅 18%~9%）' },
-        { k: 'richMode', t: '一夜暴富', d: '每月给君主所在城加钱，都城满了会自动接着给其他己方城池。引擎金币上限会自动按实际写入值校准（默认 30000/城）' },
-        { k: 'richAmount', t: '暴富金额', d: '一夜暴富每月注入的钱数。发放时会逐城列出实际到账金额；若所有己方城池都到上限，剩余部分不会发放并会提示' },
-        { k: 'allTools', t: '获取全部道具', d: '每月把道具表里所有「真实存在的道具」（已按名字过滤空槽位）投放到君主所在城。想一次性给全请用游戏内「资源管理」' },
         { k: 'levelBoost', t: '武将等级提升', d: '每月给全部己方武将 +30 经验（引擎经验条满 100 即升 1 级，等级上限由引擎 maxLevel 决定，默认 30）' },
-        { k: 'levelBoostAll', t: '全员满级（读档即生效）', d: '默认关。开启后每次读档 / 新开局，自动把全部己方武将直接拉到等级上限。也可在游戏内「资源管理」手动一键满级' },
         { k: 'forgeGuarantee', t: '强化必定成功', d: '默认关。开启后强化成功率强制 100%（费用照收），配合铁匠铺快速刷高等级用' },
-        { k: 'forgeMount', t: '允许强化纯坐骑', d: '默认关。纯坐骑只加移动、不影响伤害，强化它没有收益；开启后可当移动加成养着玩' },
         { k: 'aiEmptyCity', t: 'AI 攻占空城', d: '原版 AI 永远不打无主城（引擎目标筛选排除了空城）。开启后每月最多让相邻 AI 势力派 1 名武将进驻空城，月报有记录' },
         { k: 'waterTactic', t: '水城地形修正', d: '北海、吴等水域战场：无水兵的部队战力大幅折减（骑兵最惨、水兵不受影响）。水域占比在亲历战斗时自动记录并永久缓存' },
         { k: 'verbose', t: '控制台详细日志', d: '输出每次结算的战力对比、水域占比与胜率，便于调权重' }
@@ -3674,13 +4088,14 @@
             + wfBtn(0, '原版') + wfBtn(1, '较多') + wfBtn(2, '频繁')
             + '</div><div class="tip" style="text-align:left">当前：<b id="bayeCheatWfNow"></b>。决定 AI 每月主动出击的总量与激进程度：原版=保守（约 4 次/月，需 35% 优势）、较多=正常（约 7 次，需 20%）、频繁=活跃（约 10 次，势均力敌也敢打）。<b>智慧引擎关闭时本项不生效</b>（完全原版机制）。</div>'
             + '<h4>铁匠铺（装备强化）</h4>'
-            + '<div class="tip" style="text-align:left">游戏内按 <b>H</b> →「铁匠铺」进入：选武将 → 选装备槽 → 确认花钱。'
-            + '等级<b>不设上限</b>，费用 <code>30×稀有度×(等级+1)^1.3</code>（指数上涨），成功率 '
-            + '<code>100/100/95/90/82/70/60/50/40/32/24/18/13/9</code>。<br>'
-            + '<b>失败 -1 级</b>；但 <b>+' + FORGE_SAFE_LV + ' 起进入高阶保护</b>（失败只损钱不降级，DNF 强化保护券的简化版）——'
-            + '否则低成功率叠掉落级会变成随机游走，实测期望花费高达 597 万金，等于永远打不到 +13。<br>'
-            + '伤害加成走<b>饱和曲线</b>：<code>×(1 + 0.55×L/(L+6.5))</code> —— +1 就有感、越高越递减，'
-            + '+13 约 <b>+42%</b>，不会盖过武将本身的武力/智力差异。<br>'
+            + '<div class="tip" style="text-align:left">游戏内按 <b>H</b> →「铁匠铺」进入：选武将 → 选装备槽 → 确认花钱。<br>'
+            + '<b>上限 +' + FORGE_MAX + '</b>；费用 <code>40×稀有度×(等级+1)^1.3</code>（+1 约 100 金，+20 约 2100 金，单次封顶 ' + FORGE_COST_MAX + ' = 单城金币上限）。<br>'
+            + '成功率 <code>' + FORGE_RATE.slice(0, 11).join('/') + '/…</code>（+10 约 38%，+20 约 4%），<b>连败 ' + FORGE_PITY_STREAK + ' 次后下一次必成</b>。<br>'
+            + '<b>失败 -1 级</b>；但 <b>+' + FORGE_SAFE_LV + ' 起进入高阶保护</b>（失败只损钱不降级，DNF 强化保护券的简化版）。<br>'
+            + '<b>收益永不饱和</b>：<code>×(1 + L×0.05×(1+0.055L))</code> —— '
+            + '+1 约 ×1.05、+10 约 ×1.78、+20 约 <b>×3.1（+210%）</b>，'
+            + '每级增量缓慢变小但<b>永不归零</b>，高投入始终有回报；+' + FORGE_SOFT_CAP + ' 之后每级收益降到 1/3，由你自己决定停手。<br>'
+            + '<b>纯坐骑不可强化</b>（只加移动、不影响伤害），可在上面单独开启。<br>'
             + '<b>等级不设上限</b>：费用按 1.3 次幂自然涨到「不可能达到」，伤害系数走饱和曲线自动收敛，不会无限膨胀。<br>'
             + '<b>纯坐骑不可强化</b>（只加移动、不影响伤害），可在上面单独开启。<br>'
             + '<b>不改引擎面板</b>：强化等级记在本地表里，装备的武力/智力显示值保持原样；'
@@ -3695,7 +4110,7 @@
             + '</div>'
             + '<div class="tip" style="text-align:left">0 = 禁止武将战死（默认）。调高后月底按倍率抽取败方参战者阵亡（装备掉落战斗城），可游戏内「武将修复」找回 —— 调高立即生效，本月已登记战斗马上结算。<b id="bayeCheatDrNow"></b></div>'
             + '<h4>结算权重（AI 托管战斗）</h4><div class="nums">'
-            + num('richAmount', '暴富金额', 500) + num('wGen', '武将素质', 0.1) + num('wArms', '兵力', 0.1)
+            + num('wGen', '武将素质', 0.1) + num('wArms', '兵力', 0.1)
             + num('wDef', '城防', 0.1) + num('spread', '随机性', 0.1)
             + '</div>'
             + '<div class="tip" style="text-align:left">'
@@ -3715,10 +4130,10 @@
             + '当前游戏存档：<b id="bayeCheatSaveNow">识别中…</b>　数据槽：<b id="bayeCheatSlotNow">?</b></div>'
             + '<div class="fn" id="bayeCheatSlot">'
             + slotBtn('auto', '自动') + slotBtn('tmp', '临时') + slotBtn('1', '槽1') + slotBtn('2', '槽2') + slotBtn('3', '槽3')
+            + '<div class="nums" style="margin-top:8px">'
+            + num('richAmount', '每次加的钱/粮（立即加钱·立即加粮·每月自动都用它）', 500)
             + '</div>'
-            + '<div class="nums" style="margin-top:8px">' + num('moneyCap', '金币上限(0=自动)', 0) + '</div>'
-            + '<div class="fn"><button data-fn="probeCap">重新探测金币上限</button></div>'
-            + '<div class="tip" style="text-align:left">若「立即加钱」加不进去，多半是金币已到引擎硬上限。点「重新探测金币上限」会实测引擎真正的上限；也可手动填上限（0 = 跟随实测值）。</div>';
+            + '<div class="tip" style="text-align:left">资源上限由引擎控制：金币月结被夹在 30000，粮草超过 65536 会绕回 0；开启「解除金币/粮草上限」后，金币可跨月结转累积到 65535，粮草每月补到 65535。</div>';
         html += '<h4>其他</h4><div class="fn">'
             + '<button data-fn="reset">恢复默认设置</button>'
             + '</div><div class="tip">月报 / 势力分布 / 排行 / 图鉴 / 跟踪都在游戏内：按 H（或触屏「帮助」）打开金手指菜单。图标可拖动，点面板外任意处收起。</div>';
@@ -3861,9 +4276,6 @@
                     saveCfg();
                     log('已恢复默认设置');
                     location.reload();
-                } else if (f === 'probeCap') {
-                    try { probeMoneyCap(); } catch (e) { alert2('探测失败：' + e.message); }
-                    refreshSlotBtns();
                 }
             };
         });
@@ -3931,6 +4343,9 @@
     function refreshSlotBtns() {
         each(document.querySelectorAll('#bayeCheatSlot .slot'), function (b) {
             b.classList.toggle('on', b.getAttribute('data-slot') === slotSelection());
+            /* 实际在用的槽位也点亮：自动模式下 save_sangoN → 折算成第几个档（0/2/4→1/2/3） */
+            var live = liveSlotTag();
+            b.classList.toggle('live', live !== '' && b.getAttribute('data-slot') === live);
         });
         var el = document.getElementById('bayeCheatSlotNow');
         if (el) el.textContent = currentSlot() + '（选择：' + slotSelection() + '）';
@@ -3941,6 +4356,17 @@
             sv.textContent = (currentSaveId() ? currentSaveId() + '.sav' : '未识别（tmp 临时槽）')
                 + '　（存档 ' + uniq.length + ' 个：' + uniq.join('/') + '）';
         }
+    }
+    /* 当前数据槽对应的按钮标签（自动模式下把 save_sangoN 映射成槽1/2/3） */
+    function liveSlotTag() {
+        var sl = currentSlot();
+        if (sl.indexOf('save_sango') === 0) {
+            var n = parseInt(sl.replace('save_sango', ''), 10);
+            if (isFinite(n)) return String(n / 2 + 1);      /* sango0→槽1、sango2→槽2、sango4→槽3 */
+        }
+        if (sl === 'tmp') return 'tmp';
+        if (sl.indexOf('slot') === 0) return sl.replace('slot', '');
+        return '';
     }
     /* 面板是注入时一次性渲染的，存档切换发生在之后 → 必须持续同步，
        否则面板会一直停在「识别中…」。这里每秒只比对两个字符串，代价可忽略。 */

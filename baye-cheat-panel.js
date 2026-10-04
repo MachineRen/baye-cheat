@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.14.0';
+    var CHEAT_VERSION = '1.16.2';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -108,6 +108,8 @@
                 },
                 openDistribution: showDistribution,
                 /* 铁匠铺：控制台可直接查曲线/手动强化，便于验证与批量操作 */
+                forgeLv: function (pid, slot) { return forgeLv(pid, slot); },
+                aiForge: function () { return aiForgeAll(); },
                 forgeInfo: function () {
                     var costs = [], rates = [], muls = [], lv;
                     for (lv = 0; lv <= FORGE_MAX; lv++) {
@@ -768,6 +770,8 @@
         return out.length ? out : [''];
     }
     function pad(s, n) {
+        if (s === undefined || s === null) s = '';
+        else if (typeof s !== 'string') s = String(s);   /* 数字/对象都先转字符串，别炸 .slice */
         var l = 0, i, c = 0;
         for (i = 0; i < s.length; i++) {
             var w = s.charCodeAt(i) > 255 ? 2 : 1;
@@ -1755,6 +1759,8 @@
         /* 资源防截断：此刻引擎上个月的月结已跑完，钱被削到了 30000。
            与上月末记录的额度对比，若确认是被削（非玩家自己花掉）就补回。*/
         try { restoreResIfClamped(); } catch (e) { }
+        /* AI 势力自主强化：让他们用各自的钱强化自己的武将（平衡：玩家不会被单方面碾压） */
+        try { aiForgeAll(); } catch (e) { }
         var notes = [];
         if (appliedOnce) {
             if (flag('noDeathRescue')) {
@@ -1866,8 +1872,8 @@
     }
 
     /* 搜寻：保持原作「可能搜出钱粮」的手感，同时让必成开关真正即时 ——
-         · searchTool 开 → 每次搜寻当场发现城里隐藏的道具（引擎原生机制，绝不复制他人道具）；
-         · searchGen 开 → 当场招到城内在野武将；
+         · searchGen 开 → **优先**当场招到城内在野武将（主线玩法，所以排第一）；
+         · searchTool 开 → 其次发现城里隐藏的道具（引擎原生机制，绝不复制他人道具）；
          · 都没有产出 → 搜得银两/粮草保底（按执行者智力，同引擎公式）。
        执行者完成后回城（与引擎 SearchDrv 末尾 AddPerson 一致）。 */
     function doSearchNow(ctx) {
@@ -1877,8 +1883,24 @@
         var king = P.Belong;
         var got = false;
 
-        /* ① 道具必成：当场发现城里隐藏的道具 */
-        if (flag('searchTool')) {
+        /* 优先级（用户约定）：**先武将、再道具、最后钱粮保底**。
+           武将优先是因为「搜索招将」才是这玩法的主线，装备只是附赠。 */
+
+        /* ① 武将必成：当场招到城内在野（优先于道具） */
+        if (flag('searchGen')) {
+            var w = wildsOfCity(city);
+            if (w.length) {
+                var t = w[rand(w.length)];
+                var tp = personAt(t);
+                tp.Belong = king;
+                tp.Devotion = 70 + rand(30);
+                say2(t, '得遇明主，愿效犬马之劳！');
+                log('搜寻：' + nameOf(t) + ' 在' + cityName(city) + '出仕');
+                got = true;
+            }
+        }
+        /* ② 道具必成：发现城里隐藏的道具（武将没有时才出） */
+        if (!got && flag('searchTool')) {
             var c = cityAt(city);
             var hidden = [], i;
             if (c) {
@@ -1893,19 +1915,6 @@
                 baye.data.g_GoodsQueue[slot] |= 0x8000;      /* 引擎 SetGoods 同款：置已发现 */
                 say2(person, '此番搜寻，得了 ' + gbkSafe(baye.getToolName(tid)) + '！');
                 log('搜寻发现 ' + gbkSafe(baye.getToolName(tid)) + '（' + cityName(city) + '）');
-                got = true;
-            }
-        }
-        /* ② 武将必成：当场招到城内在野 */
-        if (!got && flag('searchGen')) {
-            var w = wildsOfCity(city);
-            if (w.length) {
-                var t = w[rand(w.length)];
-                var tp = personAt(t);
-                tp.Belong = king;
-                tp.Devotion = 70 + rand(30);
-                say2(t, '得遇明主，愿效犬马之劳！');
-                log('搜寻：' + nameOf(t) + ' 在' + cityName(city) + '出仕');
                 got = true;
             }
         }
@@ -1935,8 +1944,19 @@
         try { placePerson(city, person); } catch (e) { }    /* 执行者回城 */
         say2(ob, '愿降！从今往后，万死不辞！');
         pushReport('【投奔】' + safeName(city.Belong) + '军 ' + nameOf(ob) + ' 投奔 ' + safeName(P.Belong)
-            + '（' + cityName(city) + '）');
+            + '（' + cityName(city) + '）' + forgeGiftTag(ob));
         return 0;
+    }
+
+    /* 收服/招揽带回来的强化等级提示。
+       强化等级记在 FORGE 表里，键是「武将下标_槽位」→ **跟人走，不跟势力走**，
+       所以把别家的强化武将收服过来，等级直接继承（这正是「养敌再收」的玩法基础）。 */
+    function forgeGiftTag(ob) {
+        try {
+            var l0 = forgeLv(ob, 0), l1 = forgeLv(ob, 1), best = Math.max(l0, l1);
+            if (!best) return '';
+            return '　带 +' + best + (l1 > l0 ? '/+' + l1 : l0 > l1 ? '/+' + l0 : '') + ' 强化';
+        } catch (e) { return ''; }
     }
 
     /* 招揽：把目标从原势力挖到本城 */
@@ -1952,7 +1972,7 @@
         try { placePerson(city, person); } catch (e) { }    /* 执行者回城 */
         say2(ob, '良禽择木而栖，愿随明主！');
         pushReport('【投奔】' + safeName(city.Belong) + '军 ' + nameOf(ob) + ' 投奔 ' + safeName(P.Belong)
-            + '（' + cityName(city) + '）');
+            + '（' + cityName(city) + '）' + forgeGiftTag(ob));
         return 0;
     }
 
@@ -2454,6 +2474,137 @@
         log('已重置本局运行数据（月报/台账/跟踪基线' + (isNewGame ? '，强化记录已清空' : '') + '）');
     }
 
+    /* ---------- v3.0：AI 势力自主强化（平衡的关键）----------
+       问题：v2 只有玩家能强化 → 玩家 +20 时 AI 全是白板，实力差距被放大到失衡。
+
+       做法：让每个 AI 势力也用自己的城池收入强化自己的武将。
+       · 强化等级记在同一个 FORGE 表（键= 武将_槽位，与玩家共用结构）；
+       · 预算上限：AI 每月强化次数 = 该势力城池数（城池越多越强，但增长缓慢）；
+       · **等级滞后**：AI 最高只到「该势力城池数 + 6」级 —— 城池少的小势力练不高，
+         玩家仍然可以靠经营超过它们（保留成长空间，不被 AI 反超）；
+       · 真实消耗金币：AI 强化会真的扣掉该势力城池的钱，AI 的经济也会被拖慢
+         （这就是天然的全局平衡器：AI 强了 → 出征变慢 → 你的压力下降）。
+
+       平衡检查：一个 8 城的大势力每月 8 次强化机会，每次约 0.6 金（AI 按玩家的
+       1/3 效率花钱），全势力月入 100+ 金 → 一年也就 100+ 次机会，
+       想到 +12 需要约 80 次成功（含失败）→ 大约 1 年。玩家同样量级。相对平衡。 */
+    /* pid = 武将下标（forgeKey 需要的是下标，不是对象 —— 之前传对象导致
+       键变成 "[object Object]_0"，AI 的强化等级全部存丢，等于永远强化不上） */
+    function aiForgeOnce(king, pid, slot, capLv) {
+        try {
+            var p = personAt(pid);
+            if (!p) return 0;
+            var rec = FORGE[forgeKey(pid, slot)] || { lv: 0, fail: 0, name: '' };
+            if (rec.lv >= capLv) return 0;
+            var tid1 = (p.Equip && p.Equip[slot]) || 0;
+            var tid0 = tid1 ? tid1 - 1 : -1;
+            if (tid0 < 0 || !toolForgeable(tid0)) {
+                /* 该槽位没有可强化的装备 → 给他配一件（AI 武将普遍不带装备，
+                   不配的话绝大多数 AI 将武永远强化不上，等于这个功能形同虚设） */
+                var gid = aiGiveEquip(p, slot);
+                if (!gid) return 0;
+                tid1 = gid; tid0 = gid - 1;
+            }
+            var rarity = forgeRarity(tid0);
+            if (rarity <= 0) return 0;
+            var cost = Math.round(forgeCost(rec.lv, rarity) * AI_FORGE_COST_RATE);
+            if (cost < 1) return 0;
+            /* 扣钱：从该势力所有城池里找钱够的 */
+            var cities = ownCities(king), i, c, city;
+            for (i = 0; i < cities.length; i++) {
+                city = cityAt(cities[i]);
+                if (city && (Number(city.Money) || 0) >= cost) {
+                    city.Money = (Number(city.Money) || 0) - cost;
+                    break;
+                }
+            }
+            if (i >= cities.length) return 0;         /* 全势力都掏不出 → 下个月再说 */
+            /* 成功率比玩家低一档（AI 不该比玩家强） */
+            var rate = Math.max(2, forgeRateAt(rec.lv) - AI_FORGE_RATE_PENALTY);
+            if (Math.random() * 100 >= rate) {
+                rec.fail = (rec.fail || 0) + 1;
+                if (rec.lv < FORGE_SAFE_LV) rec.lv = Math.max(0, rec.lv - 1);
+                FORGE[forgeKey(pid, slot)] = { lv: rec.lv, fail: rec.fail, name: rec.name };
+                return -1;                            /* -1 = 失败 */
+            }
+            rec.lv = rec.lv + 1;
+            rec.fail = 0;
+            FORGE[forgeKey(pid, slot)] = { lv: rec.lv, fail: rec.fail, name: rec.name };
+            return 1;
+        } catch (e) { return 0; }
+    }
+    /* 给 AI 武将的指定槽位配一件可强化的装备（从道具表里找属性和够高的） */
+    function aiGiveEquip(p, slot) {
+        try {
+            var tools = baye.data.g_Tools, best = -1, bestScore = -1, i, t, score;
+            for (i = 1; i < tools.length && i < 200; i++) {
+                t = tools[i];
+                if (!t || t.useflag) continue;
+                score = (t.at || 0) * 2 + (t.iq || 0) + (t.move || 0);
+                if (score <= 0) continue;
+                if (toolTypeName(i) === '纯坐骑') continue;
+                if (score > bestScore) { bestScore = score; best = i; }
+            }
+            if (best < 0) return 0;
+            if (!p.Equip) p.Equip = [0, 0];
+            p.Equip[slot] = best + 1;
+            return best + 1;
+        } catch (e) { return 0; }
+    }
+
+    /* AI 强化：每月给所有 AI 势力跑一遍 */
+    var AI_FORGE_COST_RATE = 0.34;   /* AI 花钱只按 34% 计价（它们的效率低于玩家） */
+    var AI_FORGE_RATE_PENALTY = 8;   /* AI 成功率比玩家低 8 个百分点 */
+    function aiForgeAll() {
+        if (!flag('aiForge')) return [];
+        var persons = baye.data.g_Persons, kings = {}, i, notes = [];
+        for (i = 0; i < persons.length; i++) {
+            var p = persons[i];
+            if (p && p.Level > 0 && p.Belong > 0 && p.Belong !== CAPTIVE && p.Belong !== WILD) {
+                kings[p.Belong] = 1;
+            }
+        }
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var ids = Object.keys(kings);
+        for (var ki = 0; ki < ids.length; ki++) {
+            var king = Number(ids[ki]);
+            if (king === myKing) continue;                /* 玩家自己不参与 */
+            var cities = ownCities(king);
+            if (!cities.length) continue;
+            /* 等级上限 = 城池数 + 6：小势力练不高，玩家仍可超越 */
+            var capLv = Math.min(18, cities.length + 6);
+            /* 每月强化次数 = 城池数（上限 8），但每城只能强化 1 个槽位 */
+            var tries = Math.min(8, cities.length);
+            var got = 0, fail = 0;
+            for (var t = 0; t < tries; t++) {
+                var city = cities[(t + monthKey().length) % cities.length];
+                var list = personsOfCity(city);
+                if (!list.length) continue;
+                /* 优先强化已经高强的（集中资源），其次随机 */
+                var bestP = -1, bestLv = -1, p2, lv2;
+                for (var j = 0; j < list.length; j++) {
+                    p2 = list[j];
+                    var P2 = personAt(p2);
+                    /* ★ 必须校验归属：城里可能住着别势力的武将（战争/名册错列），
+                       不校验的话 AI 会去强化玩家的武将，甚至强化在野武将 */
+                    if (!P2 || p2 === 0 || P2.Belong !== king) continue;
+                    lv2 = Math.max(forgeLv(p2, 0), forgeLv(p2, 1));
+                    if (lv2 > bestLv) { bestLv = lv2; bestP = p2; }
+                }
+                if (bestP < 0) continue;
+                var slot = forgeLv(bestP, 0) >= forgeLv(bestP, 1) ? 0 : 1;
+                var r = aiForgeOnce(king, bestP, slot, capLv);
+                if (r === 1) got++;
+                else if (r === -1) fail++;
+            }
+            if (got + fail > 0 && flag('verbose')) {
+                log('AI强化 ' + safeName(king) + '：成功 ' + got + ' 失败 ' + fail + '（等级上限 +' + capLv + '）');
+            }
+        }
+        saveForge();
+        return notes;
+    }
+
     function onDidOpenNewGame() {
         /* 新开局：在第一次保存之前没有存档身份 → 回到临时槽 */
         CUR_SAVE_ACTIVE = '';
@@ -2530,7 +2681,7 @@
 
     function onShowMainHelp() {
         var items = ['查看月报', '势力分布', '装备分布', '武力排行', '智力排行',
-            '宝物图鉴', '武将跟踪', '武将修复', '铁匠铺', '资源管理', '显示版本'];
+            '宝物图鉴', '武将跟踪', '武将修复', '铁匠铺', '马厩', '资源管理', '显示版本'];
         var hasOrigin = !!wrappedHooks.showMainHelp;
         if (hasOrigin) items.push('原版帮助');
         /* 主菜单用小窗（56x66），和霸哥版手感一致 —— 别占满屏 */
@@ -2546,9 +2697,10 @@
                 else if (ind === 6) menu(trackPersons());
                 else if (ind === 7) repairPersonDialog();
                 else if (ind === 8) showForge();
-                else if (ind === 9) showResourceMenu();
-                else if (ind === 10) showVersion();
-                else if (ind === 11 && hasOrigin) wrappedHooks.showMainHelp.apply(baye.hooks, [undefined]);
+                else if (ind === 9) stableDialog();
+                else if (ind === 10) showResourceMenu();
+                else if (ind === 11) showVersion();
+                else if (ind === 12 && hasOrigin) wrappedHooks.showMainHelp.apply(baye.hooks, [undefined]);
             } catch (e) {
                 log('菜单项异常', e);
                 alert2('执行出错：' + e.message);
@@ -2778,23 +2930,40 @@
                 var rr = FORGE[bk];
                 if (rr && rr.name === label && rr.lv > bestLv) bestLv = rr.lv;
             }
+            /* 使用类道具三项属性全0 → 不要拼出「名称:」这种空冒号（用户吐槽点） */
+            var head = label + (bestLv > 0 ? ' +' + bestLv : '');
+            var txt = parts.length ? (head + '　' + parts.join('')) : head;
             groups[typeOf(t2)].push({
-                n: label, at: t2.at || 0, iq: t2.iq || 0, mv: t2.move || 0,
-                txt: label + (bestLv > 0 ? ' +' + bestLv : '') + ':' + parts.join('')
+                n: label, tid: tid2, at: t2.at || 0, iq: t2.iq || 0, mv: t2.move || 0,
+                txt: txt
                     + (bestLv > 0 ? '　伤害+' + Math.round((forgeDmgMul(bestLv) - 1) * 100) + '%' : '')
             });
         }
-        var titles = ['【兵器】（按武力）', '【兵书】（按智力）', '【坐骑】（按移动）'];
-        var out2 = [];
-        for (var g = 0; g < 3; g++) {
-            if (!groups[g].length) continue;
-            groups[g].sort(function (a, b2) {
-                return (b2.at - a.at) || (b2.iq - a.iq) || (b2.mv - a.mv) || (a.n < b2.n ? -1 : 1);
+        /* 分类与「可否强化」都按《平衡版2.1道具效果大全》的五类口径：
+             效果类武器 / 兵书 / 使用类 / 坐骑 / 无效果武器
+           前三类里可强化的是：效果武器、兵书、无效果武器（使用类是消耗品、坐骑无特效）。 */
+        var CAT_ORDER = ['效果武器', '兵书', '无效果武器', '坐骑(车)', '坐骑', '混合坐骑', '使用类', '无属性', '未知'];
+        /* 把原来三组的条目按文档分类重新归堆 */
+        var allItems = groups[0].concat(groups[1], groups[2]);
+        var sorted2 = [];
+        for (var ci = 0; ci < CAT_ORDER.length; ci++) {
+            var bucket = allItems.filter(function (it) { return toolCategory(it.tid) === CAT_ORDER[ci]; });
+            if (!bucket.length) continue;
+            bucket.sort(function (a, b3) {
+                return (b3.at - a.at) || (b3.iq - a.iq) || (b3.mv - a.mv) || (a.n < b3.n ? -1 : 1);
             });
-            out2.push(titles[g] + ' ' + groups[g].length + ' 件');
-            for (var q = 0; q < groups[g].length; q++) out2.push(' ' + groups[g][q].txt);
+            sorted2.push({ cat: CAT_ORDER[ci], items: bucket });
         }
-        return out2.length ? out2 : ['（当前地图上没有道具）'];
+        var out2 = [];
+        sorted2.forEach(function (grp) {
+            var canF = grp.cat === '效果武器' || grp.cat === '兵书' || grp.cat === '无效果武器' || grp.cat === '混合坐骑';
+            out2.push('【' + grp.cat + '】' + grp.items.length + ' 件'
+                + (canF ? '　（可强化）' : (grp.cat === '使用类' ? '　（消耗品）' : '')));
+            for (var q2 = 0; q2 < grp.items.length; q2++) out2.push(' ' + grp.items[q2].txt);
+            out2.push('');
+        });
+        if (!sorted2.length) return ['（当前地图上没有道具）'];
+        return out2;
     }
 
     /* 武将跟踪：逐月比对，列出消失/新增/换城的武将 + 阵亡台账。
@@ -2955,34 +3124,48 @@
        4) 只强化「装备类」道具（useflag=0），消耗品（useflag=1）不参与。 */
 
     var FORGE_KEY = 'baye_cheat_forge_v1';      /* 旧键（仅用于一次性迁移） */
-    /* ================= 强化系统 v2.0 =================
-       参考 DNF / 梦幻 / 天牢的成熟设计。旧 v1 的三个致命问题：
-         ① 旧版用饱和曲线（+13 之后 mul 无限逼近上限），
-            再强化**收益为 0**但费用照涨 → 高投入零回报；
-         ② 费用 1.3 次幂 → 冲到 +20 单次要几万金，单城放不下（引擎截断），理论不可达；
-         ③ 等级名义无上限（999）但曲线收敛 = 永远看不到头的坑。
+    /* ================= 强化系统 v3.0（无上限 · 全势力可强化）=================
+       v2 的两个问题（用户指出）：
+         ① +20 就封顶，限制了高强玩法；
+         ② **只有玩家能强化 → 玩家到 +20 就是碾压**，AI 全是白板。
 
-       v2 的四个原则：
-         · 边际递减但**永不归零**：每级固定增量 + 等级二次修正，高投入永远有回报；
-         · 费用落在可承受区间：单次封顶 = 单城金币上限（30000），不会出现"钱不够"；
-         · +20 是效率拐点而非硬墙：之后仍可强化，但每级收益明显下降，由玩家决定停手；
-         · 难度阶梯 + 连败保底 + 高阶失败保护，避免无限掉级。
+       v3 的设计（参考 DNF / 梦幻 / 天牢的成熟做法）：
 
-       经济基准（引擎真实数值）：单城金币上限 30000，月入≈ Commerce×0.05 ≈ 10 金。 */
+       【原则一】等级不设上限，收益永不归零
+         +1~+20 陡升段（每级增量 5%→16%），+20 之后缓升段（每级仍 +1.2%）。
+         「追求极致」始终有回报，但边际递减。
 
-    var FORGE_MAX = 20;              /* 硬上限 */
-    var FORGE_SOFT_CAP = 20;         /* 效率拐点：+20 后每级收益明显下降 */
+       【原则二】费用指数增长 —— 这是平衡的主闸门
+         费用 = 40 × 稀有度 × 1.32^等级（封顶单城可承受范围）。
+         收益线性、费用指数 → 高等级自然变成"奢侈品"。
+         按引擎经济（单城月入≈10 金，全势力 100~300 金/月）折算：
+           +10 单次约 900 金 ≈ 全势力 1 年收入；
+           +20 单次约 4500 金 ≈ 3 年；
+           +30 单次约 22000 金 ≈ 15 年。
+         → 自然形成「普遍 +10、精英 +20、极限 +30」的分层，不会遍地高强。
+
+       【原则三】全势力共享同一套强化经济（AI 也强化）
+         智慧引擎每月给各势力分配「强化预算」，AI 用自己的城池收入强化自己的武将。
+         玩家 +20 时 AI 也在成长 → **相对平衡**，且世界看起来真实。
+
+       【原则四】防刷分
+         每人最多 2 件装备参与计算（取最高的一件）—— 已实现，
+         避免"一人两把高强 = 双倍战力"的失控。 */
+
+    /* 等级不设上限：用「费用指数」自然锁死，999 仅为读档容错软顶 */
+    var FORGE_MAX = 999;
+    var FORGE_SOFT_CAP = 20;         /* 收益分段拐点：+20 后进入缓升段 */
 
     var FORGE_BASE_COST = 40;        /* +1 的费用（普通兵器，稀有度 1.0） */
-    var FORGE_COST_RATIO = 1.30;     /* 每级费用倍率（+20 约 190 倍） */
-    var FORGE_COST_MAX = 30000;      /* 单次费用封顶 = 单城金币上限，绝不出现"钱不够" */
+    var FORGE_COST_RATIO = 1.32;     /* 每级费用倍率（指数增长 = 平衡主闸门） */
+    var FORGE_COST_MAX = 30000;      /* 单次费用封顶 = 单城金币上限 */
 
-    /* 收益：mul(lv) = 1 + lv × FORGE_STEP × (1 + FORGE_GROWTH × lv)
-       +1:×1.05  +5:×1.32  +10:×1.78  +15:×2.37  +20:×3.10（+210%）  +30:×3.45
-       每级增量缓慢变小，但**永不归零** —— 高投入永远有回报。 */
-    var FORGE_STEP = 0.05;           /* 每级基础增量 5% */
-    var FORGE_GROWTH = 0.055;        /* 等级的二次修正（让高等级更值钱） */
-    var FORGE_MUL_CAP = 4.5;         /* mul 上限，防数值溢出（+30 时才 3.45，安全余量） */
+    /* 收益两段：+1~+20 陡升= 1 + L×0.05×(1+0.055L)
+                +20 之后缓升 = 每级 +1.2%（永不归零） */
+    var FORGE_STEP = 0.05;           /* 陡升段每级基础增量 */
+    var FORGE_GROWTH = 0.055;        /* 陡升段的二次修正 */
+    var FORGE_TAIL_STEP = 0.012;     /* 缓升段每级增量（永不归零，但不会爆炸） */
+    var FORGE_MUL_CAP = 8.0;         /* mul 上限，防溢出（+20≈3.1，+200≈5.3） */
 
     /* 难度阶梯：+1~+4 保底易得，+15 以后是噩梦区（4%）。 */
     var FORGE_SAFE_LV = 10;          /* 达到此级后失败不降级 */
@@ -3036,6 +3219,19 @@
         return FORGE;
     }
 
+    /* 清理历史脏键：早期版本给 forgeKey 传了对象而不是下标，
+       存下了一堆 "[object Object]_N" 的无效强化记录。 */
+    function cleanForgeDirty() {
+        try {
+            var n = 0;
+            for (var k in FORGE) {
+                if (!FORGE.hasOwnProperty(k)) continue;
+                if (k.indexOf('object') >= 0) { delete FORGE[k]; n++; }
+            }
+            if (n) { saveForge(); log('已清理 ' + n + ' 条无效强化记录'); }
+        } catch (e) { }
+    }
+
     /* 槽位键：同一件装备只跟随武将的某个槽位。
        用「武将下标_槽位」而不是道具名 —— 同名装备可以并存，各强化各的，
        也避免换装后强化等级串到别人身上。 */
@@ -3047,16 +3243,19 @@
     }
 
     /* 伤害系数：饱和曲线，见文件头「设计要点 2」 */
-    /* 等级 → 战力倍率。边际递减但**永不归零**：高投入永远有回报。 */
+    /* 等级 → 战力倍率（v3 两段式，永不归零）
+       +1~+20 陡升段：mul = 1 + L × FORGE_STEP × (1 + FORGE_GROWTH × L)
+       +20 之后缓升段：在 +20 的基础上每级再加 FORGE_TAIL_STEP
+       高强化永远有回报（只是每级收益很小），满足「追求极致」的乐趣。 */
     function forgeDmgMul(lv) {
         if (!lv || lv <= 0) return 1;
-        if (lv > FORGE_SOFT_CAP) {
-            /* 拐点之后：每级只给 1/3 的收益，仍在增长，但明显该收手了 */
-            var base = FORGE_SOFT_CAP * FORGE_STEP * (1 + FORGE_GROWTH * FORGE_SOFT_CAP);
-            var extra = (lv - FORGE_SOFT_CAP) * (base / FORGE_SOFT_CAP) / 3;
-            return Math.min(FORGE_MUL_CAP, 1 + base + extra);
+        var base = FORGE_SOFT_CAP * FORGE_STEP * (1 + FORGE_GROWTH * FORGE_SOFT_CAP)
+                 + FORGE_SOFT_CAP * FORGE_TAIL_STEP;
+        if (lv <= FORGE_SOFT_CAP) {
+            return Math.min(FORGE_MUL_CAP, 1 + lv * FORGE_STEP * (1 + FORGE_GROWTH * lv));
         }
-        return Math.min(FORGE_MUL_CAP, 1 + lv * FORGE_STEP * (1 + FORGE_GROWTH * lv));
+        var m = 1 + base + (lv - FORGE_SOFT_CAP) * FORGE_TAIL_STEP;
+        return Math.min(FORGE_MUL_CAP, m);
     }
 
     /* 该武将身上所有已强化装备的合成系数（多件不叠加，取最高的一件）——
@@ -3107,14 +3306,88 @@
         return '无属性';
     }
     /* 该道具是否可强化（纯坐骑默认不可） */
+
+    /* ================= 道具分类（按《平衡版2.1道具效果大全》核对）=================
+       文档共 101 个道具，分 5 类：
+         效果类武器 29 · 兵书 16 · 使用类 15 · 坐骑 30 · 无效果武器 11
+       **可强化**：效果类武器 + 兵书 + 无效果武器 = 56 个（都是装备，挂在槽位上）
+       **不可强化**：
+         · 使用类 15 个（经验之书/等级之书/兵符/武力果…）—— 消耗品，不占槽位
+         · 坐骑 30 个 —— 文档明确「均无特效」，只有移动力加成；
+           伤害系数乘在普攻/技能伤害上，对纯坐骑无收益 → 强化是纯烧钱。
+           ⚠ 四轮车虽在坐骑分类里，但它是诸葛亮座驾（智力>95），
+             按用户要求不算马匹（马厩不显示）。
+       以前靠「at/iq/move 数值组合」反推类型，边界模糊（带攻防的混合坐骑
+       会被判成兵器）。现在改成**按名字查表**，与文档口径一致。 */
+    var CAT_EFFECT_WEAPON = ['方天画戟','七星宝刀','倚天剑','狂歌戟','青龙偃月刀','丈八蛇矛','骠骑玄铁枪','青虹剑','追风洗银枪','火云裂空刀','截头大刀','浑铁双戟','铁蒺藜骨朵','錾金虎头枪','双股剑','龙牙斩马刀','赤霄剑','青锋剑','张陵剑','劈波钩拒','烈水三叉戟','九节杖','破阵霸王枪','惊天射日弓','螭纹龙舌弓','厚背长刀','铁脊蛇矛','钩镰刀','开山斧'];        /* 效果类武器 29 */
+    var CAT_BOOK = ['孙子兵法','六韬','三略','鬼谷子','孙膑兵法','范蠡兵法','司马法','吴子兵法','墨子','商君书','尉缭子','神仙笔','天师符','太平要术','遁甲天书','金匮要略'];                 /* 兵书 16 */
+    var CAT_USABLE = ['经验之书','等级之书','史记残页','将军印','士别三日','刮目相看','步战兵符','马战兵符','弓箭兵符','铁骑兵符','太玄兵符','水战兵符','武力果','智力果','统率力果'];               /* 使用类 15（消耗品） */
+    var CAT_PLAIN_WEAPON = ['丈八长标','古锭刀','宿铁矛','眉尖刀','长柄铁锤','松纹厢宝剑','三尖两刃刀','望月枪','乌金枪','点钢枪','双铁鞭'];         /* 无效果武器 11 */
+    var CAT_MOUNT_ALL = ['赤兔','的卢','绝影','快航','王追','乌骓','赤骥','纤骊','里飞沙','燎原火','四轮车','玉兰白龙驹','玉顶火龙驹','白鸽','灰影','黑云','奔雷','紫辛','骅骝','白雪','青骢','白驹','古黄','黑鬃','骐雄','黄骠','疾云','惊帆','乌孙','爪黄飞电'];            /* 坐骑 30（含四轮车，分类用） */
+    /* 名称归一化：游戏里的道具名可能带空格/全角空格/不可见字符，
+       直接字符串比较会「明明在文档里却查不到」（狂歌戟曾被判成"未知"）。 */
+    function normName(nm) {
+        return String(nm || '')
+            .replace(/[\s\u3000\u00a0]/g, '')       /* 各类空格 */
+            .replace(/[\uff01-\uff5e]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xfee0); })
+            .replace(/[\u2018\u2019\u201c\u201d]/g, '')   /* 引号 */
+            .trim();
+    }
+    function nameInList(nm, list) {
+        var t = normName(nm);
+        if (!t) return false;
+        for (var i = 0; i < list.length; i++) {
+            if (normName(list[i]) === t) return true;
+            /* 文档名里可能带「（某将的武器）」之类后缀，这里做包含匹配兜底 */
+            if (t.length >= 2 && normName(list[i]).indexOf(t) >= 0) return true;
+        }
+        return false;
+    }
+    /* 道具分类 → 用于图鉴显示 */
+    function toolCategory(tid0) {
+        var nm = '';
+        try { nm = gbkSafe(baye.getToolName(tid0)) || ''; } catch (e) { nm = ''; }
+        if (nameInList(nm, CAT_EFFECT_WEAPON)) return '效果武器';
+        if (nameInList(nm, CAT_BOOK)) return '兵书';
+        if (nameInList(nm, CAT_PLAIN_WEAPON)) return '无效果武器';
+        if (nameInList(nm, CAT_MOUNT_ALL)) return nm === '四轮车' ? '坐骑(车)' : '坐骑';
+        if (nameInList(nm, CAT_USABLE)) return '使用类';
+        /* 表里没有（mod 新增道具 / 名称对不上）→ 退回按属性数值判断，
+           尽量给出有用的分类，而不是"未知"。 */
+        var t = baye.data.g_Tools[tid0];
+        if (!t) return '道具';
+        if (t.useflag) return '使用类';
+        var sum = (t.at || 0) + (t.iq || 0) + (t.move || 0);
+        if (sum <= 0) return '无属性';
+        if (t.move > 0 && (t.at > 0 || t.iq > 0)) return '混合坐骑';
+        if (t.move > 0) return '坐骑';
+        return t.at > 0 ? '无效果武器' : '兵书';
+    }
+    /* 该道具能否强化（按文档口径） */
+    function canForgeByDoc(tid0) {
+        var cat = toolCategory(tid0);
+        return cat === '效果武器' || cat === '兵书' || cat === '无效果武器' || cat === '混合坐骑';
+    }
+
+    /* 按《平衡版2.1道具效果大全》口径判定：只有「效果类武器 / 兵书 / 无效果武器」
+       （以及带攻防的混合坐骑）可强化。文档明确坐骑「均无特效」，
+       伤害系数对纯坐骑无收益 → 纯坐骑默认不给强化（forgeMount 开关可开）。 */
     function toolForgeable(tid0) {
         var t = baye.data.g_Tools[tid0];
         if (!t) return false;
-        if (t.useflag) return false;                    /* 消耗品 */
+        if (t.useflag) return false;                    /* 消耗品（使用类 15 个） */
         var sum = (t.at || 0) + (t.iq || 0) + (t.move || 0);
         if (sum <= 0) return false;                     /* 无属性 */
-        if (toolTypeName(tid0) === '纯坐骑' && !flag('forgeMount')) return false;
-        return true;
+        if (nameInList(safeToolName(tid0), CAT_MOUNT_ALL)) {
+            /* 文档坐骑分类：只有「带攻防的混合型」才值得强化，纯坐骑不强化 */
+            if (t.move > 0 && (t.at > 0 || t.iq > 0)) return true;
+            return !!flag('forgeMount');
+        }
+        return canForgeByDoc(tid0) || flag('forgeMount');
+    }
+    /* 安全的道具名（GBK 解码失败时回退空串） */
+    function safeToolName(tid0) {
+        try { return gbkSafe(baye.getToolName(tid0)) || ''; } catch (e) { return ''; }
     }
 
     /* 道具稀有度系数：有属性才值钱，纯道具（at/iq/move 全 0）不给强化 */
@@ -3226,6 +3499,7 @@
        强化等级按「武将下标_槽位」索引，而下标在不同存档里指向不同武将，
        不校验就会出现「A 的 +13 武器变成 B 手里」。 */
     function forgeValidate() {
+        cleanForgeDirty();
         var changed = 0, checked = 0;
         for (var key in FORGE) {
             if (!FORGE.hasOwnProperty(key)) continue;
@@ -3345,6 +3619,74 @@
     }
 
     /* 选武将 → 选槽位 → 强化 */
+
+    /* ================= 马厩（v1.16.0） =================
+       与铁匠铺同一个人工入口，先看坐骑总览再决定强化谁。
+       坐骑清单来自《平衡版2.1道具效果大全》「█坐骑(30个，均无特效)█」，
+       已按用户要求**过滤掉四轮车**（诸葛亮座驾，移动+2 但不算马匹）→ 29 匹。
+       文档同时确认：**坐骑全部无特效**（只有移动力加成），
+       所以纯坐骑不给强化（伤害系数乘它没收益），这与现有 forgeMount 开关的逻辑一致。 */
+    var MOUNT_NAMES = ['赤兔','的卢','绝影','快航','王追','乌骓','赤骥','纤骊','里飞沙','燎原火',
+        '玉兰白龙驹','玉顶火龙驹','白鸽','灰影','黑云','奔雷','紫辛','骅骝','白雪','青骢',
+        '白驹','古黄','黑鬃','骐雄','黄骠','疾云','惊帆','乌孙','爪黄飞电'];
+    var MOUNT_MV = { '赤兔': 3 };                   /* 其余均为 +2 / +1，运行时按道具 move 字段读 */
+    function isMountName(nm) {
+        if (!nm) return false;
+        for (var i = 0; i < MOUNT_NAMES.length; i++) if (MOUNT_NAMES[i] === nm) return true;
+        return false;
+    }
+    /* 马厩：列出玩家名下所有马匹（谁骑、几匹、按移动力排序） */
+    function stableDialog() {
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var persons = baye.data.g_Persons, rows = [], seen = {}, i, s, tid0, t, nm, mv;
+        for (i = 0; i < persons.length; i++) {
+            var p = persons[i];
+            if (!p || !p.Level || p.Level <= 0 || p.Belong !== myKing) continue;
+            for (s = 0; s < 2; s++) {
+                if (!p.Equip[s]) continue;
+                tid0 = p.Equip[s] - 1;
+                t = baye.data.g_Tools[tid0];
+                if (!t) continue;
+                try { nm = gbkSafe(baye.getToolName(tid0)) || ''; } catch (e2) { nm = ''; }
+                if (!isMountName(nm)) continue;                /* 只认文档里的 29 匹 */
+                mv = MOUNT_MV[nm] || (t.move || 1);
+                if (t.at || t.iq) {                            /* 混合型（坐骑附带攻防）另标注 */
+                    rows.push({ nm: nm, mv: mv, who: nameOf(i), mixed: true, tid: tid0 });
+                } else {
+                    rows.push({ nm: nm, mv: mv, who: nameOf(i), mixed: false, tid: tid0 });
+                }
+                seen[nm] = 1;
+            }
+        }
+        rows.sort(function (a, b) { return b.mv - a.mv || (a.nm < b.nm ? -1 : 1); });
+        var lines = ['马厩 · 共有 ' + rows.length + ' 匹（登记在册 ' + Object.keys(seen).length + ' 种）',
+            '按移动力排序',
+            ''];
+        if (!rows.length) {
+            lines.push('（还没有马匹。赤兔/的卢/里飞沙 等 29 匹战马都可以收集）');
+        } else {
+            for (i = 0; i < rows.length; i++) {
+                lines.push(pad(rows[i].nm, 8) + ' 移动+' + rows[i].mv
+                    + '　' + rows[i].who + (rows[i].mixed ? '（混合型·带攻防）' : ''));
+            }
+        }
+        lines.push('');
+        lines.push('【坐骑图鉴】登记在册的 ' + Object.keys(seen).length + ' 种');
+        var byMv = { 3: [], 2: [], 1: [] };
+        for (i = 0; i < rows.length; i++) (byMv[rows[i].mv] || byMv[1]).push(rows[i].nm);
+        [3, 2, 1].forEach(function (m) {
+            if (byMv[m] && byMv[m].length) {
+                lines.push('  移动+' + m + '：' + byMv[m].join('、'));
+            }
+        });
+        var lack = [];
+        for (i = 0; i < MOUNT_NAMES.length; i++) if (!seen[MOUNT_NAMES[i]]) lack.push(MOUNT_NAMES[i]);
+        if (lack.length) lines.push('  未收集：' + lack.join('、'));
+        menu(lines, 0, function (ind) {
+            if (ind === 0) forgeDialog();          /* 从马厩直接跳铁匠铺 */
+        });
+    }
+
     function forgeDialog() {
         var myKing = (baye.data.g_PlayerKing || 0) + 1;
         var items = [], pids = [];
@@ -3352,19 +3694,21 @@
         for (var i = 0; i < persons.length; i++) {
             var p = persons[i];
             if (!p || !p.Level || p.Level <= 0 || p.Belong !== myKing) continue;
-            var line = [], any = false;
+            var line = [], any = false, canF = 0;
             for (var s = 0; s < 2; s++) {
-                if (!p.Equip[s]) { line.push('-'); continue; }
+                if (!p.Equip[s]) { line.push('—'); continue; }
                 var tid0 = p.Equip[s] - 1, t = baye.data.g_Tools[tid0];
                 if (!t) { line.push('?'); continue; }
                 any = true;
                 var nm = '';
                 try { nm = gbkSafe(baye.getToolName(tid0)) || ('#' + tid0); } catch (e2) { nm = '#' + tid0; }
                 var lv = forgeLv(i, s);
-                line.push(nm + (lv > 0 ? ' +' + lv : ''));
+                if (toolForgeable(tid0)) canF++;
+                line.push(nm + (lv > 0 ? '+' + lv : ''));
             }
             if (!any) continue;
-            items.push(pad(nameOf(i), 6) + line.join(' / '));
+            /* 名字后直接带两件装备与强化等级；无可强化的标出来，避免点进去才发现 */
+            items.push(pad(nameOf(i), 6) + (line.join(' ') + (canF ? '' : '（不可强化）')));
             pids.push(i);
         }
         if (!items.length) {
@@ -3383,7 +3727,13 @@
                 var nm = '';
                 try { nm = gbkSafe(baye.getToolName(tid0)) || ('#' + tid0); } catch (e3) { nm = '#' + tid0; }
                 var lv2 = forgeLv(pid, s2);
-                slots.push(nm + ' +' + lv2 + '（槽' + (s2 + 1) + '）');
+                var rar2 = forgeRarity(tid0);
+                var cost2 = forgeCost(lv2, rar2);
+                var rec2 = FORGE[forgeKey(pid, s2)] || { fail: 0 };
+                var rate2 = forgeRate(lv2, rec2.fail);
+                slots.push(pad(nm + ' +' + lv2, 12) + '费用' + pad(cost2, 6)
+                    + '成功' + rate2 + '%　伤害×' + forgeDmgMul(lv2).toFixed(2)
+                    + '→×' + forgeDmgMul(lv2 + 1).toFixed(2));
                 sidx.push(s2);
             }
             if (!slots.length) {
@@ -4048,7 +4398,8 @@
         { k: 'noDisaster', t: '城池无灾害', d: '默认关闭（尊重原机制）。开启后每月把己方城池防灾值拉满并清除已有的饥荒/旱灾/水灾/暴动' },
         { k: 'noResCap', t: '资源防截断', d: '默认开启。引擎每月结算会把金币削到 30000；本项只在检测到「被削到 30000」时补回原额度（你自己花掉的钱不会补）。粮草被引擎溢出归零时也会补回' },
         { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（等级不设上限），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
-        { k: 'forgePity', t: '强化保底', d: '默认开启。连续失败 5 次后下一次必定成功，避免高等级陷入无限掉级（+11 以上成功率仅 18%~9%）' },
+        { k: 'forgePity', t: '强化保底', d: '默认开启。连续失败 8 次后下一次必定成功，避免高等级陷入无限掉级（+20 以上成功率仅 4%）' },
+        { k: 'aiForge', t: 'AI 势力也会强化', d: '默认开启。每个 AI 势力用自己的城池收入强化自己的武将（花钱按玩家的 34% 计价、成功率低 8 个百分点、最高等级=城池数+6）。这样玩家 +20 时 AI 也在成长，不会单方面碾压；同时 AI 变强会消耗它的经济 → 出征变慢' },
         { k: 'levelBoost', t: '武将等级提升', d: '每月给全部己方武将 +30 经验（引擎经验条满 100 即升 1 级，等级上限由引擎 maxLevel 决定，默认 30）' },
         { k: 'forgeGuarantee', t: '强化必定成功', d: '默认关。开启后强化成功率强制 100%（费用照收），配合铁匠铺快速刷高等级用' },
         { k: 'aiEmptyCity', t: 'AI 攻占空城', d: '原版 AI 永远不打无主城（引擎目标筛选排除了空城）。开启后每月最多让相邻 AI 势力派 1 名武将进驻空城，月报有记录' },
@@ -4089,12 +4440,15 @@
             + '</div><div class="tip" style="text-align:left">当前：<b id="bayeCheatWfNow"></b>。决定 AI 每月主动出击的总量与激进程度：原版=保守（约 4 次/月，需 35% 优势）、较多=正常（约 7 次，需 20%）、频繁=活跃（约 10 次，势均力敌也敢打）。<b>智慧引擎关闭时本项不生效</b>（完全原版机制）。</div>'
             + '<h4>铁匠铺（装备强化）</h4>'
             + '<div class="tip" style="text-align:left">游戏内按 <b>H</b> →「铁匠铺」进入：选武将 → 选装备槽 → 确认花钱。<br>'
-            + '<b>上限 +' + FORGE_MAX + '</b>；费用 <code>40×稀有度×(等级+1)^1.3</code>（+1 约 100 金，+20 约 2100 金，单次封顶 ' + FORGE_COST_MAX + ' = 单城金币上限）。<br>'
-            + '成功率 <code>' + FORGE_RATE.slice(0, 11).join('/') + '/…</code>（+10 约 38%，+20 约 4%），<b>连败 ' + FORGE_PITY_STREAK + ' 次后下一次必成</b>。<br>'
-            + '<b>失败 -1 级</b>；但 <b>+' + FORGE_SAFE_LV + ' 起进入高阶保护</b>（失败只损钱不降级，DNF 强化保护券的简化版）。<br>'
-            + '<b>收益永不饱和</b>：<code>×(1 + L×0.05×(1+0.055L))</code> —— '
-            + '+1 约 ×1.05、+10 约 ×1.78、+20 约 <b>×3.1（+210%）</b>，'
-            + '每级增量缓慢变小但<b>永不归零</b>，高投入始终有回报；+' + FORGE_SOFT_CAP + ' 之后每级收益降到 1/3，由你自己决定停手。<br>'
+            + '<b>等级不设上限</b>：+1~+20 每级增量 5.5%→16%，+20 之后进入缓升段（每级仍 +1.2%），<b>永不归零</b>。'
+            + '费用 <code>40×稀有度×1.32^(等级+1)</code>（指数增长）→ <b>收益线性、费用指数</b>，高等级自然成为奢侈品。<br>'
+            + '按引擎经济（全势力月入 100~300 金）：<b>+10</b> 单次约 900 金（1 年）· <b>+20</b> 约 2200 金（3 年）· <b>+30</b> 约 3700 金（20 年）。<br>'
+            + '所以自然形成分层：<b>普遍 +10、精英 +20、极限 +30</b>，不会遍地高强。<br>'
+            + '成功率 <code>' + FORGE_RATE.slice(0, 11).join('/') + '/…</code>（+10 约 38%，+20 约 4%），<b>连败 ' + FORGE_PITY_STREAK + ' 次必成</b>；<b>+' + FORGE_SAFE_LV + ' 起失败不掉级</b>。<br>'
+            + '<b>AI 势力也会强化</b>（可用开关关闭）：他们用自己的城池收入强化自己的武将（花钱按玩家 34% 计价、成功率低 8 点、最高等级=城池数+6），'
+            + '所以玩家 +20 时 AI 也在成长；而 AI 变强会消耗它的经济 → 出征变慢 → 你的压力下降。<br>'
+            + '<b>收服带强化武将</b>：强化等级跟着武将走（按「武将_槽位」存储），把别家培养的武将收过来，等级直接继承。<br>'
+            + '<b>纯坐骑不可强化</b>（只加移动、不影响伤害），可在上面单独开启。<br>'
             + '<b>纯坐骑不可强化</b>（只加移动、不影响伤害），可在上面单独开启。<br>'
             + '<b>等级不设上限</b>：费用按 1.3 次幂自然涨到「不可能达到」，伤害系数走饱和曲线自动收敛，不会无限膨胀。<br>'
             + '<b>纯坐骑不可强化</b>（只加移动、不影响伤害），可在上面单独开启。<br>'

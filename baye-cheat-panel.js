@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.16.2';
+    var CHEAT_VERSION = '1.17.0';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -186,6 +186,9 @@
                 },
                 probeMoneyCap: probeMoneyCap,
                 /* 换月/读档时清空「本月已打过」账本；控制台与测试也用它复位 */
+                /* 重置出征节奏（调试用：清掉冷却与加码计数） */
+                resetWarRhythm: function () { WAR_LAST = {}; WAR_COUNT = {}; return true; },
+                warRhythm: function () { return { last: WAR_LAST, count: WAR_COUNT, mk: gameMonthIndex(), warmup: WARMUP_MONTHS, cd: WAR_COOLDOWN }; },
                 resetAttackLog: function () { ATTACKED.month = ''; ATTACKED.targets = {}; return true; },
                 showMonthReport: showMonthReport,
                 sidePowerOf: function (pid) { return genPower(pid); }
@@ -2043,6 +2046,19 @@
     }
     /* 最近一次进攻「目标城 → 出发城」台账：写出征单时记下，月报战报里回显「自 XX 进攻」 */
     var ATTACK_SRC = {};
+    /* 出征节奏控制（v1.17.0）：
+       用户反馈「再强势也不要第二个月就打过来，兵都还没配」。
+       根因：原逻辑只��「战力门槛 gate」，**没有任何时间维度** → 开局的 190年1月建势力、
+       2月就攒够兵打邻居，玩家完全没时间布防。
+       现在加三道时间闸门（都在 smartPlan 的选目标环节生效）：
+         ① 开局冷静期：新局前 6 个月不主动进攻（只回防）；
+         ② 每战冷却：同一势力两次进攻至少间隔 N 个月（默认 3）；
+         ③ 逐步加码：优势门槛随「本势力参战次数」递增（越打越谨慎），
+            避免一个强国连续月月开打。 */
+    var WAR_LAST = {};          /* 势力 -> 上次进攻的月份键 */
+    var WAR_COUNT = {};         /* 势力 -> 累计主动进攻次数 */
+    var WARMUP_MONTHS = 6;      /* 开局冷静期（月） */
+    var WAR_COOLDOWN = 3;       /* 两次进攻的最小间隔（月） */
     /* 本月智慧引擎排出的出征单，月末核对结果：
        出征记录是「决定出兵」，战斗记录才是「打完了」。两者对不上时（引擎延后执行、
        或这一仗没打成）要说清楚，否则玩家会以为出征没有结果。 */
@@ -2262,6 +2278,22 @@
     }
 
     /* 单个势力的月度战略推演。返回本月出击次数 */
+    /* 本势力这个月能否主动进攻（时间维度闸门） */
+    function warGateOpen(king) {
+        var ym = monthKey(), mk = gameMonthIndex();
+        /* ① 开局冷静期：全局开局后的前 N 个月不主动进攻 */
+        if (mk < WARMUP_MONTHS) return false;
+        /* ② 冷却：距上次进攻不足 N 个月 */
+        var last = WAR_LAST[king];
+        if (last !== undefined && (mk - last) < WAR_COOLDOWN) return false;
+        return true;
+    }
+    /* 全局月份序号（从 190 年 1 月算起），用于冷静期判断 */
+    function gameMonthIndex() {
+        var p = (baye.data.g_PIdx || 1);
+        return (baye.data.g_YearDate - 190) * 12 + (baye.data.g_MonthDate || 1) + (p - 1) * 10000;
+    }
+
     function smartPlan(king, level, maxSortie, budget, out) {
         var cities = baye.data.g_Cities;
         var mine = [], c, i, j;
@@ -2335,8 +2367,12 @@
         /* ③ 出击：自身安全 + 有富余 的城，挑最划算的目标 */
         var sortie = 0;
         var cands = mine.slice().sort(function (a, b) { return danger[a] - danger[b]; });
+        /* ★ 时间闸门（用户要求）：再强势也不要第2 个月就打过来。
+           放在出征循环内、只挡「主动进攻」；上面的回防逻辑完全不受影响。 */
+        var canAttack = warGateOpen(king);
         for (i = 0; i < cands.length && sortie < maxSortie && sortie < budget; i++) {
             c = cands[i];
+            if (!canAttack) break;                          /* 冷静期/冷却中 → 本月不主动打 */
             if (danger[c] > 0.85) continue;                 /* 自顾不暇，不打 */
             var gl = gens[c] || cityGenerals(c, king, busy);
             /* 同上：都城只在受威胁时才多留一人 */
@@ -2350,7 +2386,11 @@
                 var defP = cityGuardPower(tc, nc.Belong);
                 /* 玩家与 AI 平等：同门槛，无新手保护。出征频率档位联动门槛：
                    越频繁越敢打，避免「势力均衡 → 谁都不过门槛 → 天下太平五年」的闷局 */
-                var gate = Math.max(0.95, (level === 2 ? 1.15 : 1.35) - (Number(cfg.warFreq) || 0) * 0.15);
+                /* 逐步加码：打过的次数越多，门槛越高（-0.06/次，最多 +0.3），
+                   避免一个强国月月开打。 */
+                var warCount = WAR_COUNT[king] || 0;
+                var gate = Math.max(0.95, (level === 2 ? 1.15 : 1.35)
+                    - (Number(cfg.warFreq) || 0) * 0.15 + Math.min(0.3, warCount * 0.06));
                 var availP = 0, g2;
                 for (g2 = 0; g2 < gl.length - keepC; g2++) availP += personPower(gl[g2]);
                 if (availP < defP * gate) continue;         /* 打不动，跳过 */
@@ -2360,7 +2400,8 @@
             if (bestT < 0) continue;
             /* 配兵：从强到弱累加到够用为止，剩下的留守（不再倾巢而出） */
             var defP2 = cityGuardPower(bestT, cities[bestT].Belong);
-            var gate2 = Math.max(0.95, (level === 2 ? 1.15 : 1.35) - (Number(cfg.warFreq) || 0) * 0.15);
+            var gate2 = Math.max(0.95, (level === 2 ? 1.15 : 1.35)
+                - (Number(cfg.warFreq) || 0) * 0.15 + Math.min(0.3, (WAR_COUNT[king] || 0) * 0.06));
             var team = [], pw = 0;
             for (j = 0; j < gl.length - keepC && team.length < FGT_PLAMAX; j++) {
                 team.push(gl[j]);
@@ -2372,6 +2413,9 @@
                 sortie++;
                 gens[c] = gl.slice(team.length);            /* 已编入军团，不再算守军 */
                 guard[c] = cityGuardPower(c, king);
+                /* ★ 记下本次进攻的时间与次数 → 冷却期 & 逐步加码的依据 */
+                WAR_LAST[king] = gameMonthIndex();
+                WAR_COUNT[king] = (WAR_COUNT[king] || 0) + 1;
                 /* 记下目标，用于月末核对「出征后是否真的打了这一仗」 */
                 PENDING_SORTIE.push({ target: bestT, src: c, month: monthKey() });
                 log('出征：' + safeName(king) + '军 自 ' + cityName(c)
@@ -2468,7 +2512,8 @@
             /* 读档：强化是长期投入，只校验槽位道具名是否还对得上（换档后自动丢弃失效记录） */
             forgeValidate();
         }
-        PENDING_PLACE = {}; PENDING_SORTIE = []; BELONG_SNAP = null; DISASTER_SNAP = null;            /* 待归位君主 */
+        PENDING_PLACE = {}; PENDING_SORTIE = []; BELONG_SNAP = null; DISASTER_SNAP = null;
+        WAR_LAST = {}; WAR_COUNT = {};         /* 出征节奏：上次进攻月份 / 累计次数 */
         ATTACKED.month = ''; ATTACKED.targets = {};
         ATTACK_SRC = {};                /* 进攻出发城台账 */
         log('已重置本局运行数据（月报/台账/跟踪基线' + (isNewGame ? '，强化记录已清空' : '') + '）');
@@ -2617,6 +2662,8 @@
         /* 读档：把「真正在玩的存档」定下来（此时引擎刚读完目标档与其配对档），
            数据槽随之切换 —— 全自动，玩家无需任何操作 */
         try { hookEngineSaveIO(); } catch (e) { }
+        /* 换档：出征节奏重置（上一局的冷却/加码不该延续到新存档） */
+        WAR_LAST = {}; WAR_COUNT = {};
         var seen = CUR_SAVE_SEEN;
         if (seen && CUR_SAVE_ACTIVE !== seen) {
             CUR_SAVE_ACTIVE = seen;

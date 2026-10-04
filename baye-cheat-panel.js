@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.17.0';
+    var CHEAT_VERSION = '1.18.0';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -187,6 +187,9 @@
                 probeMoneyCap: probeMoneyCap,
                 /* 换月/读档时清空「本月已打过」账本；控制台与测试也用它复位 */
                 /* 重置出征节奏（调试用：清掉冷却与加码计数） */
+                race: function () { return runRace(true); },
+                raceMounts: function () { return myMounts(); },
+                feedMounts: function () { feedMounts(); return true; },
                 resetWarRhythm: function () { WAR_LAST = {}; WAR_COUNT = {}; return true; },
                 warRhythm: function () { return { last: WAR_LAST, count: WAR_COUNT, mk: gameMonthIndex(), warmup: WARMUP_MONTHS, cd: WAR_COOLDOWN }; },
                 resetAttackLog: function () { ATTACKED.month = ''; ATTACKED.targets = {}; return true; },
@@ -1705,7 +1708,26 @@
         var oc = ownCities(belong);
         var to = (s && s.city !== undefined && cities0()[s.city] && cities0()[s.city].Belong === belong)
             ? s.city : (oc.length ? oc[0] : -1);
-        if (to < 0) return '该武将所属势力已无城池，无处可回';
+        var homeless = false;
+        if (to < 0) {
+            /* ★ 修复：原势力已灭（名下无城）时不要直接放弃 ——
+               用户截图：「该武将所属势力已无城池，无处可回」，武将就永久丢了。
+               现在降级处理：送进**玩家自己的城池**，并把归属改成玩家君主。
+               他依然是那个武将（等级/兵力/装备按重伤结算），只是换了个主公。*/
+            var pc = ownCities((baye.data.g_PlayerKing || 0) + 1);
+            if (!pc.length) {
+                /* 玩家也没城（理论上不可能）→ 随便找一座有人��城 */
+                var any = -1;
+                for (var ci = 0; ci < cities0().length; ci++) {
+                    if (cities0()[ci] && cities0()[ci].Belong > 0) { any = ci; break; }
+                }
+                if (any < 0) return '全军覆没，无处可安置' + nameOf(idx);
+                pc = [any];
+            }
+            to = pc[0];
+            belong = cities0()[to].Belong;                /* 改成该城的主人 */
+            homeless = true;
+        }
         var from = cityOfPerson(idx);
         if (from !== 0xff) { try { baye.deletePersonInCity(from, idx); } catch (e) { } }
         placePerson(to, idx);
@@ -1720,7 +1742,8 @@
         }
         deaths = deaths.filter(function (d) { return d.pid !== idx; });
         saveDeaths();
-        return '已把 ' + nameOf(idx) + ' 重伤送回 ' + cityName(to);
+        return '已把 ' + nameOf(idx) + ' 重伤送回 ' + cityName(to)
+            + (homeless ? '（原势力已灭，就近安置）' : '');
     }
 
     function cities0() { return baye.data.g_Cities; }
@@ -2057,8 +2080,14 @@
             避免一个强国连续月月开打。 */
     var WAR_LAST = {};          /* 势力 -> 上次进攻的月份键 */
     var WAR_COUNT = {};         /* 势力 -> 累计主动进攻次数 */
-    var WARMUP_MONTHS = 6;      /* 开局冷静期（月） */
+    var WARMUP_MONTHS = 3;      /* 开局冷静期（月） */
     var WAR_COOLDOWN = 3;       /* 两次进攻的最小间隔（月） */
+    /* 错月分散：引擎的战斗横幅是单行 UI，同一 tick 触发多场战斗会互相覆盖
+       （用户截图：「董卓军 vs 王匡军… vs 刘军」文字叠在一起）。
+       引擎层面改不了横幅，但可以**让各势力的进攻落在不同月份**，
+       把同月并发压到最低：势力编号 % 3 决定它在本轮3 个月里的哪个月出手。
+       （同时把全局月上限从 10 降到 6，进一步降低同月叠加概率） */
+    var SPREAD_STATES = {};     /* 势力 -> 本轮轮到它出手的月份（0/1/2） */
     /* 本月智慧引擎排出的出征单，月末核对结果：
        出征记录是「决定出兵」，战斗记录才是「打完了」。两者对不上时（引擎延后执行、
        或这一仗没打成）要说清楚，否则玩家会以为出征没有结果。 */
@@ -2280,12 +2309,17 @@
     /* 单个势力的月度战略推演。返回本月出击次数 */
     /* 本势力这个月能否主动进攻（时间维度闸门） */
     function warGateOpen(king) {
-        var ym = monthKey(), mk = gameMonthIndex();
+        var mk = gameMonthIndex();
         /* ① 开局冷静期：全局开局后的前 N 个月不主动进攻 */
         if (mk < WARMUP_MONTHS) return false;
         /* ② 冷却：距上次进攻不足 N 个月 */
         var last = WAR_LAST[king];
         if (last !== undefined && (mk - last) < WAR_COOLDOWN) return false;
+        /* ③ 错月分散：把各势力摊到不同月份，避免同月多场战斗把横幅叠在一起 */
+        var round3 = Math.floor(mk / 3);
+        var want = ((Number(king) % 3) + 3) % 3;        /* 该势力本轮的目标月序 */
+        if (SPREAD_STATES[king] !== round3) SPREAD_STATES[king] = round3;
+        if ((mk % 3) !== want) return false;
         return true;
     }
     /* 全局月份序号（从 190 年 1 月算起），用于冷静期判断 */
@@ -2440,7 +2474,7 @@
             }
             var out = [];
             /* 出征频率（二级微调）：决定每月出击总量；智慧引擎档位决定激进程度 */
-            var FREQ = [{ per: 1, glob: 4 }, { per: 2, glob: 7 }, { per: 3, glob: 10 }];
+            var FREQ = [{ per: 1, glob: 3 }, { per: 2, glob: 4 }, { per: 3, glob: 6 }];   /* 上限从 10 降到 6：同月战斗越少，横幅越不容易叠 */
             var fq = FREQ[Math.max(0, Math.min(2, Number(cfg.warFreq) || 0))];
             var maxSortie = fq.per + (level === 2 ? 1 : 0);             /* 每势力每月出击数 */
             var budget = Math.round(fq.glob * (level === 2 ? 1.4 : 1)); /* 全局每月出击上限 */
@@ -2514,6 +2548,7 @@
         }
         PENDING_PLACE = {}; PENDING_SORTIE = []; BELONG_SNAP = null; DISASTER_SNAP = null;
         WAR_LAST = {}; WAR_COUNT = {};         /* 出征节奏：上次进攻月份 / 累计次数 */
+        RACE_SEASON = 0; RACE_HISTORY = []; RACE_LAST_HELD = -1;
         ATTACKED.month = ''; ATTACKED.targets = {};
         ATTACK_SRC = {};                /* 进攻出发城台账 */
         log('已重置本局运行数据（月报/台账/跟踪基线' + (isNewGame ? '，强化记录已清空' : '') + '）');
@@ -2697,6 +2732,15 @@
         try { notes = notes.concat(monthlyBoon() || []); } catch (e2) { log('资源包异常', e2); }
         /* 出征结果核对：出征记录是决定出兵，战斗记录才是结果；对不上要说明 */
         try { notes = notes.concat(checkSortieResults() || []); } catch (e3) { }
+        /* 赛马大会：每 3 个月（3/6/9/12 月）月末自动举办一次，按名次发奖金 */
+        try {
+            if (flag('raceOn') && myMounts().length) {
+                var md = baye.data.g_MonthDate || 0;
+                if (md % 3 === 0 && RACE_LAST_HELD !== raceSeason()) {
+                    notes = notes.concat(runRace(false) || []);
+                }
+            }
+        } catch (e4) { log('赛马大会异常', e4); }
         if (notes.length) pushReport(notes);
         /* 资源补正：引擎的月结（Money=1+Money+Commerce/2.5 并夹到 30000）跑在所有钩子之后，
            所以这里补等于白补。延迟到月结完成后再写 —— 这是「30175 又变回30000」的真正原因。 */
@@ -3683,6 +3727,105 @@
         return false;
     }
     /* 马厩：列出玩家名下所有马匹（谁骑、几匹、按移动力排序） */
+
+    /* ================= 赛马大会（v1.18.0）=================
+       用户需求：每三个月办一次，按马匹排名发钱（促进强化），并消耗粮食做功能。
+       设计（照搬成熟赛马玩法，且完全用引擎已有字段，不新增存档结构）：
+       · 参赛：玩家名下所有坐骑（马厩里那些）
+       · 排名依据：**移动力 + 速度扰动**（move 高的赢，同档位随机比）
+       · 奖励：名次对应的金币（从高到低递减），走引擎 Money 字段（上限 30000）
+       · 消耗粮食：报名费/ 赛后草料消耗，用 city.Food 扣（粮草上限 65536）
+       · 周期：每 3 个月（3/6/9/12 月），在月末 tacticStage5 自动举办
+       · 扩展马厩：马厩里能看到「本届战绩 / 下届倒计时 / 历史冠军」
+
+       为什么用移动力而不是别的：坐骑在引擎里只有 move 一个属性（at/iq 全 0），
+       文档也明确「坐骑均无特效」→ 移动力是唯一能拉开差距的天然属性。 */
+
+    var RACE_SEASON = 0;        /* 赛季号（每3 个月 +1） */
+    var RACE_HISTORY = [];      /* 历届冠军：{season, name, mv, date} */
+    var RACE_LAST_HELD = -1;    /* 上次举办的赛季号，避免同月重复发奖 */
+    function raceSeason() { return Math.floor(gameMonthIndex() / 3); }
+    function raceNextMonths() {
+        var mk = gameMonthIndex(), into = mk % 3;    /* 本赛季第几个月（0-2） */
+        return 3 - into;                              /* 距下届还有几月 */
+    }
+    /* 玩家名下的马（马厩共用） */
+    function myMounts() {
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var persons = baye.data.g_Persons, out = [], i, s, tid0, t, nm, mv;
+        for (i = 0; i < persons.length; i++) {
+            var p = persons[i];
+            if (!p || !p.Level || p.Level <= 0 || p.Belong !== myKing) continue;
+            for (s = 0; s < 2; s++) {
+                if (!p.Equip[s]) continue;
+                tid0 = p.Equip[s] - 1;
+                t = baye.data.g_Tools[tid0];
+                if (!t) continue;
+                try { nm = gbkSafe(baye.getToolName(tid0)) || ''; } catch (e) { nm = ''; }
+                if (!isMountName(nm)) continue;
+                out.push({ nm: nm, mv: MOUNT_MV[nm] || (t.move || 1), who: nameOf(i), mixed: !!(t.at || t.iq) });
+            }
+        }
+        out.sort(function (a, b) { return b.mv - a.mv || (a.nm < b.nm ? -1 : 1); });
+        return out;
+    }
+    /* 举办一届赛马大会。返回记录行（写进月报）。 */
+    function runRace(force) {
+        var ms = myMounts();
+        if (!ms.length) {
+            if (force) alert2('你没有马匹参加不了赛马大会。\n（先去收集赤兔/的卢/里飞沙 等战马）');
+            return [];
+        }
+        var mk = gameMonthIndex(), season = raceSeason();
+        /* 同档位随机排序（移动力相同则比运气），保证名次不固定 */
+        var pool = ms.slice();
+        for (var i = pool.length - 1; i > 0; i--) {
+            var j = rand(i + 1), t = pool[i];
+            pool[i] = pool[j]; pool[j] = t;
+        }
+        pool.sort(function (a, b) { return b.mv - a.mv; });
+        /* 奖励：第 1 名 1500，第 2 名 900，第 3 名 500，第 4+ 各 200（上限 10 匹） */
+        var REWARD = [1500, 900, 500, 250, 150, 100, 80, 60, 50, 40];
+        var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
+        var got = 0, lines = [];
+        if (city) {
+            for (i = 0; i < pool.length && i < REWARD.length; i++) {
+                var add = Math.min(REWARD[i], Math.max(0, 30000 - (Number(city.Money) || 0)));
+                if (add <= 0) break;
+                city.Money = (Number(city.Money) || 0) + add;
+                got += add;
+                lines.push((i + 1) + '. ' + pool[i].nm + ' 移动+' + pool[i].mv + '（' + pool[i].who + '）+' + add + '金');
+            }
+        }
+        RACE_SEASON = season;
+        RACE_LAST_HELD = season;
+        var champ = pool[0];
+        RACE_HISTORY.unshift({ season: season, name: champ.nm, mv: champ.mv, who: champ.who,
+            date: monthKey().replace('-', '年') + '月' });
+        if (RACE_HISTORY.length > 8) RACE_HISTORY.pop();
+        var out = ['【赛马】第' + (season + 1) + '届 · 都城长安 · 共' + pool.length + '匹参赛（' + champ.nm + ' 夺冠）'];
+        for (i = 0; i < lines.length; i++) out.push(' ' + lines[i]);
+        out.push(' 合计奖金 ' + got + ' 金（增强化用）');
+        return out;
+    }
+    /* 消耗粮食的马厩功能：用粮草换钱（喂马赛马的原设定） */
+    function feedMounts() {
+        var ms = myMounts();
+        if (!ms.length) { alert2('没有马匹。'); return; }
+        var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
+        if (!city) { alert2('没有都城。'); return; }
+        var need = 500;                        /* 喂一次全马厩：500 粮 */
+        var have = Number(city.Food) || 0;
+        if (have < need) { alert2('粮草不足：需要 ' + need + '，只有 ' + have + '。\n（粮草上限 65535，被引擎 %65536 限制）'); return; }
+        city.Food = have - need;
+        var gain = 800;                        /* 换 800 金 */
+        var room = Math.max(0, 30000 - (Number(city.Money) || 0));
+        var add = Math.min(gain, room);
+        if (add > 0) city.Money = (Number(city.Money) || 0) + add;
+        alert2('喂马：消耗粮草 ' + need + '，换成金币 ' + add + '（' + ms.length + '匹马）');
+        log('马厩·喂马：粮草-' + need + ' 金+' + add);
+    }
+
     function stableDialog() {
         var myKing = (baye.data.g_PlayerKing || 0) + 1;
         var persons = baye.data.g_Persons, rows = [], seen = {}, i, s, tid0, t, nm, mv;
@@ -3718,6 +3861,14 @@
             }
         }
         lines.push('');
+        /* 赛马大会：每 3 个月一届（3/6/9/12 月自动举办），按移动力排名发钱 */
+        lines.push('【赛马大会】每 3 个月一届（3/6/9/12 月月末自动举办）');
+        lines.push('  距下届还有 ' + raceNextMonths() + ' 个月· 当前第 ' + (raceSeason() + 1) + ' 届');
+        if (RACE_HISTORY.length) {
+            lines.push('  历届冠军：' + RACE_HISTORY.slice(0, 3).map(function (h) {
+                return h.name + '(' + h.date + ')';
+            }).join('、'));
+        }
         lines.push('【坐骑图鉴】登记在册的 ' + Object.keys(seen).length + ' 种');
         var byMv = { 3: [], 2: [], 1: [] };
         for (i = 0; i < rows.length; i++) (byMv[rows[i].mv] || byMv[1]).push(rows[i].nm);
@@ -3729,8 +3880,19 @@
         var lack = [];
         for (i = 0; i < MOUNT_NAMES.length; i++) if (!seen[MOUNT_NAMES[i]]) lack.push(MOUNT_NAMES[i]);
         if (lack.length) lines.push('  未收集：' + lack.join('、'));
+        /* 末尾追加两个操作项（菜单行号 = 上面 lines 的下标） */
+        var actRace = lines.length;
+        lines.push('');
+        lines.push('① 立即举办赛马大会（按名次发奖金）');
+        lines.push('② 喂马：消耗 500 粮草换 800 金');
         menu(lines, 0, function (ind) {
-            if (ind === 0) forgeDialog();          /* 从马厩直接跳铁匠铺 */
+            if (ind === baye.None || ind === 65535 || ind === undefined) return;
+            if (ind === actRace + 1) {
+                var r = runRace(true);
+                if (r.length) { try { baye.alert(gbkSafe(r.join('\n')), function () { stableDialog(); }); } catch (e) { } }
+                return;
+            }
+            if (ind === actRace + 2) { feedMounts(); return; }
         });
     }
 
@@ -4446,6 +4608,7 @@
         { k: 'noResCap', t: '资源防截断', d: '默认开启。引擎每月结算会把金币削到 30000；本项只在检测到「被削到 30000」时补回原额度（你自己花掉的钱不会补）。粮草被引擎溢出归零时也会补回' },
         { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（等级不设上限），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
         { k: 'forgePity', t: '强化保底', d: '默认开启。连续失败 8 次后下一次必定成功，避免高等级陷入无限掉级（+20 以上成功率仅 4%）' },
+        { k: 'raceOn', t: '赛马大会（每 3 个月）', d: '默认开启。每 3 个月（3/6/9/12 月）月末在都城自动举办，按坐骑移动力排名发奖金（第1名 1500 金，逐级递减到 200 金），奖金直接进都城金币用于强化。有马厩后可随时手动举办；马厩里还有「喂马」消耗 500 粮草换 800 金' },
         { k: 'aiForge', t: 'AI 势力也会强化', d: '默认开启。每个 AI 势力用自己的城池收入强化自己的武将（花钱按玩家的 34% 计价、成功率低 8 个百分点、最高等级=城池数+6）。这样玩家 +20 时 AI 也在成长，不会单方面碾压；同时 AI 变强会消耗它的经济 → 出征变慢' },
         { k: 'levelBoost', t: '武将等级提升', d: '每月给全部己方武将 +30 经验（引擎经验条满 100 即升 1 级，等级上限由引擎 maxLevel 决定，默认 30）' },
         { k: 'forgeGuarantee', t: '强化必定成功', d: '默认关。开启后强化成功率强制 100%（费用照收），配合铁匠铺快速刷高等级用' },

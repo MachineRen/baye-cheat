@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.20.3';
+    var CHEAT_VERSION = '1.20.4';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -1844,7 +1844,8 @@
                 });
             }
         } catch (e7) { }
-        /* AI 势力自主强化：让他们用各自的钱强化自己的武将（平衡：玩家不会被单方面碾压） */
+        /* AI 势力：先补坐骑（赛马要有马可跑），再自主强化 */
+        try { aiGiveMounts(); } catch (e0) { }
         try { aiForgeAll(); } catch (e) { }
         var notes = [];
         if (appliedOnce) {
@@ -2673,18 +2674,44 @@
         } catch (e) { return 0; }
     }
     /* 给 AI 武将的指定槽位配一件可强化的装备（从道具表里找属性和够高的） */
-    function aiGiveEquip(p, slot) {
+    function aiGiveEquip(p, slot, wantMount, exclude) {
         try {
-            var tools = baye.data.g_Tools, best = -1, bestScore = -1, i, t, score;
+            var tools = baye.data.g_Tools, i, t, score, nm2, cand = [];
+            var skip = exclude || null;
             for (i = 1; i < tools.length && i < 200; i++) {
                 t = tools[i];
                 if (!t || t.useflag) continue;
                 score = (t.at || 0) * 2 + (t.iq || 0) + (t.move || 0);
                 if (score <= 0) continue;
-                if (toolTypeName(i) === '纯坐骑') continue;
-                if (score > bestScore) { bestScore = score; best = i; }
+                if (wantMount) {
+                    /* 要坐骑：只在 29 匹战马里挑（文档清单） */
+                    try { nm2 = gbkSafe(baye.getToolName(i)) || ''; } catch (e3) { nm2 = ''; }
+                    if (!isMountName(nm2)) continue;
+                    /* ★ 排除已分配过的坐骑名（道具下标是共享的，
+                       不按名字去重就会「多个势力拿到同一款」） */
+                    if (skip && skip[nm2]) continue;
+                } else if (toolTypeName(i) === '纯坐骑') {
+                    continue;                                   /* 兵器/兵书：不要纯坐骑 */
+                }
+                cand.push(i);
             }
-            if (best < 0) return 0;
+            if (!cand.length) return 0;
+            /* ★ 随机取，不能「取最高分」—— 否则每次都挑同一件道具，
+               会让所有势力都拿到同款（实测 6 匹马里出现 3 匹的卢）。
+               坐骑：纯随机；兵器/兵书：在最高分档里随机。 */
+            var best;
+            if (wantMount) {
+                best = cand[rand(cand.length)];
+            } else {
+                var top = [], maxSc = -1, tt2, sc2;
+                for (i = 0; i < cand.length; i++) {
+                    tt2 = tools[cand[i]];
+                    sc2 = (tt2.at || 0) * 2 + (tt2.iq || 0) + (tt2.move || 0);
+                    if (sc2 > maxSc) { maxSc = sc2; top = [cand[i]]; }
+                    else if (sc2 === maxSc) top.push(cand[i]);
+                }
+                best = top.length ? top[rand(top.length)] : cand[rand(cand.length)];
+            }
             if (!p.Equip) p.Equip = [0, 0];
             p.Equip[slot] = best + 1;
             return best + 1;
@@ -2694,6 +2721,80 @@
     /* AI 强化：每月给所有 AI 势力跑一遍 */
     var AI_FORGE_COST_RATE = 0.34;   /* AI 花钱只按 34% 计价（它们的效率低于玩家） */
     var AI_FORGE_RATE_PENALTY = 8;   /* AI 成功率比玩家低 8 个百分点 */
+    /* 给 AI 势力配坐骑：v1.20.4 起赛马只认「真实在武将身上的马」，
+       所以 AI 势力也得真的有几匹马。每势力最多 2匹（挂在不同武将上），
+       坐骑名从 29 匹里随机（全局唯一，已分配过的不再给）。 */
+    /* 已发过坐骑的势力（记在 localStorage，跟档走）—— 每月重复发放会累积出
+       同名马（实测出现两个势力的里飞沙），所以每个势力只发一次。 */
+    var AI_MOUNT_DONE = null;
+    function aiMountDone() {
+        if (AI_MOUNT_DONE) return AI_MOUNT_DONE;
+        AI_MOUNT_DONE = {};
+        try {
+            var raw = localStorage.getItem(skey('aimount_v1'));
+            if (raw) AI_MOUNT_DONE = JSON.parse(raw) || {};
+        } catch (e) { AI_MOUNT_DONE = {}; }
+        return AI_MOUNT_DONE = AI_MOUNT_DONE || {};
+    }
+    function saveAiMount() {
+        try { localStorage.setItem(skey('aimount_v1'), JSON.stringify(AI_MOUNT_DONE || {})); } catch (e) { }
+    }
+    function aiGiveMounts() {
+        if (!flag('raceOn')) return 0;
+        var DONE = aiMountDone();
+        var cities = baye.data.g_Cities, persons = baye.data.g_Persons;
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        /* 先收集已经被占用的马名（玩家 + 已有AI 马），保证全局唯一 */
+        var used = {}, i, s2, tid0, nm, t, p;
+        for (i = 0; i < persons.length; i++) {
+            p = persons[i];
+            if (!p || !p.Level || p.Level <= 0 || !p.Equip) continue;
+            for (s2 = 0; s2 < 2; s2++) {
+                if (!p.Equip[s2]) continue;
+                tid0 = p.Equip[s2] - 1;
+                t = baye.data.g_Tools[tid0];
+                if (!t) continue;
+                try { nm = gbkSafe(baye.getToolName(tid0)) || ''; } catch (e) { nm = ''; }
+                if (isMountName(nm)) used[nm] = 1;
+            }
+        }
+        var free = [];
+        for (i = 0; i < MOUNT_NAMES.length; i++) if (!used[MOUNT_NAMES[i]]) free.push(MOUNT_NAMES[i]);
+        if (!free.length) return 0;
+        var given = 0;
+        for (i = 0; i < cities.length && free.length; i++) {
+            var c = cities[i];
+            if (!c || c.Belong <= 0 || c.Belong === WILD || c.Belong === CAPTIVE) continue;
+            if (c.Belong === myKing) continue;                /* 玩家自己的不碰 */
+            if (DONE[c.Belong]) continue;                     /* 该势力已发过，不再重复发 */
+            var list = personsOfCity(i);
+            var got = 0;
+            for (var j = 0; j < list.length && got < 2; j++) {
+                var q = personAt(list[j]);
+                if (!q || q.Belong !== c.Belong || !q.Level) continue;
+                if (!q.Equip) q.Equip = [0, 0];
+                /* 挑一个还空着的槽 */
+                var slot = (q.Equip[0] ? (q.Equip[1] ? -1 : 1) : 0);
+                if (slot < 0) continue;
+                if (q.Equip[slot]) continue;
+                /* 70% 概率给坐骑，30% 给兵器/兵书（让 AI 也有强化的装备） */
+                if (Math.random() < 0.3 && free.length === 0) continue;
+                var gid = aiGiveEquip(q, slot, true, used);
+                if (!gid) { gid = aiGiveEquip(q, slot, false, null); }
+                if (gid) {
+                    try { nm = gbkSafe(baye.getToolName(gid - 1)) || ''; } catch (e4) { nm = ''; }
+                    if (isMountName(nm)) {
+                        used[nm] = 1;                 /* ★ 立刻标记，后续势力不再拿到同款 */
+                        var at = free.indexOf(nm); if (at >= 0) free.splice(at, 1);
+                    }
+                    got++; given++;
+                }
+            }
+            if (got > 0) { DONE[c.Belong] = 1; saveAiMount(); }   /* 打标：本势力不再发 */
+        }
+        return given;
+    }
+
     function aiForgeAll() {
         if (!flag('aiForge')) return [];
         var persons = baye.data.g_Persons, kings = {}, i, notes = [];
@@ -3047,28 +3148,43 @@
     function safeName(id) {
         try { return baye.getPersonNameByID(id); } catch (e) { return '-'; }
     }
-    /* 势力编号 → 君主名字。
-       ★ 不能假设「君主下标 = 势力编号 - 1」：势力编号是行政编号（1,2,11,12…），
-         跟武将在g_Persons 里的下标毫无关系 —— 那是 v1.20 的bug，
-         导致「赤兔在刘岱身上却显示成别的势力君主」，而且每局都不一样。
-       ★ 引擎里唯一可靠的线索：君主满级（Level 满）且是本势力唯一满级者。
-         所以遍历该势力所有武将，取 Level 最高者；同级则取武力+智力更高的。 */
+    /* ---------- 势力君主查询（v1.20.4 重写）----------
+       引擎里的确定事实（源码实证）：
+         city.SatrapId == g_PlayerKing + 1   ⇔  这座城是「君主所在城」
+         city.SatrapId = personID + 1（新建城时写入）
+       所以君主 = 「SatrapId 对得上」的那座城里的君主。
+       之前的错法：假设「君主下标 = 势力编号 - 1」—— 势力编号是行政编号（1,2,11,12…），
+       跟武将在 g_Persons 的下标毫无关系，必然查错。
+       现在按引擎的真实规则来：遍历城池找 SatrapId === king 的，再取该城里的君主。 */
+    /* 该势力的君主武将下标；找不到返回 -1 */
     function kingPid(king) {
         var k = Number(king);
-        var persons = baye.data.g_Persons, best = -1, bestLv = -1, bestPw = -1, i, p, lv, pw;
+        var cities = baye.data.g_Cities, persons = baye.data.g_Persons;
+        var i, c, list, j, p;
+        /* ① 优先：找 SatrapId === king 的城（君主所在城） */
+        for (i = 0; i < cities.length; i++) {
+            c = cities[i];
+            if (!c || c.Belong !== k) continue;
+            if (c.SatrapId !== k) continue;                 /* 不是君主所在城 */
+            list = personsOfCity(i);
+            for (j = 0; j < list.length; j++) {
+                p = personAt(list[j]);
+                if (!p || p.Belong !== k) continue;
+                if (p.Level <= 0) continue;
+                return list[j];                             /* 君主所在城里的第一个本势力武将 */
+            }
+        }
+        /* ② 兜底：全势力扫，取等级最高者 */
+        var best = -1, bestLv = -1;
         for (i = 0; i < persons.length; i++) {
             p = persons[i];
-            if (!p || !p.Level || p.Level <= 0) continue;
-            if (p.Belong !== k) continue;
+            if (!p || p.Level <= 0 || p.Belong !== k) continue;
             if (p.Belong === WILD || p.Belong === CAPTIVE) continue;
-            lv = p.Level;
-            pw = (p.Force || 0) + (p.IQ || 0);
-            if (lv > bestLv || (lv === bestLv && pw > bestPw)) {
-                bestLv = lv; bestPw = pw; best = i;
-            }
+            if (p.Level > bestLv) { bestLv = p.Level; best = i; }
         }
         return best;
     }
+    /* 势力编号 → 君主名字 */
     function kingName(king) {
         try {
             var pid = kingPid(king);
@@ -4019,36 +4135,45 @@
     /* 池里的马 = MOUNT_NAMES × 归属势力。
        玩家的马：扫玩家武将身上的坐骑（已搜出的）。
        AI 的马：按「势力拥有的坐骑名」清单生成，含状态，未被玩家搜到。 */
+    /* ---------- 全局马池：全部来自「武将身上的真实坐骑」----------
+       ★★v1.20.4 重大修正：之前 AI 势力的马是我**凭空生成**的（raceKingMounts 编名字），
+          所以「这匹马属于谁」根本无从查证→ 君主名只能靠猜（等级最高）→ 必然错。
+       现在改成：**任何一匹马都来自某个武将的装备槽**，因此：
+         马的归属势力 = 该武将的 Belong（真实数据）
+         君主= 该势力真正的君主（见 kingPidOfCity）
+       玩家能搜到的马 = 已在某个武将身上；搜不到的（还在野）不参赛，
+       符合「系统在野未搜出的马匹不能参加」的要求。 */
     function raceMountPool() {
         var pool = [], myKing = (baye.data.g_PlayerKing || 0) + 1;
-        var persons = baye.data.g_Persons, i, s2, tid0, t, nm;
-        /* ① 玩家的马：直接扫武将装备 */
+        var persons = baye.data.g_Persons, cities = baye.data.g_Cities;
+        var i, s2, tid0, t, nm, p, c, owner;
         for (i = 0; i < persons.length; i++) {
-            var p = persons[i];
-            if (!p || !p.Level || p.Level <= 0 || p.Belong !== myKing) continue;
+            p = persons[i];
+            if (!p || !p.Level || p.Level <= 0) continue;
+            /* 排除在野与俘虏：只有已归属某势力的马才参赛 */
+            if (p.Belong <= 0 || p.Belong === WILD || p.Belong === CAPTIVE) continue;
             for (s2 = 0; s2 < 2; s2++) {
-                if (!p.Equip[s2]) continue;
+                if (!p.Equip || !p.Equip[s2]) continue;
                 tid0 = p.Equip[s2] - 1;
                 t = baye.data.g_Tools[tid0];
                 if (!t) continue;
                 try { nm = gbkSafe(baye.getToolName(tid0)) || ''; } catch (e) { nm = ''; }
                 if (!isMountName(nm)) continue;
-                pool.push({ nm: nm, mv: MOUNT_MV[nm] || (t.move || 1), king: myKing, mine: true });
-            }
-        }
-        /* ② 各势力的马：按势力拥有的坐骑名清单（含玩家搜不到的「在野马」） */
-        var own = raceKingMounts();
-        for (var k in own) {
-            if (!own.hasOwnProperty(k)) continue;
-            var king = Number(k);
-            if (king === myKing) continue;                /* 玩家的马已从装备里扫过 */
-            var list = own[k];
-            for (i = 0; i < list.length; i++) {
-                pool.push({ nm: list[i], mv: MOUNT_MV[list[i]] || 1, king: king, mine: false });
+                c = cityOfPerson(i);                   /* 该武将驻扎的城 */
+                owner = (c >= 0 && cities[c]) ? cities[c].Belong : p.Belong;
+                pool.push({
+                    nm: nm, mv: MOUNT_MV[nm] || (t.move || 1),
+                    king: p.Belong,                      /* 马的真正归属：武将所属势力 */
+                    city: c,                             /* 所在城池（用于显示） */
+                    rider: nameOf(i),                     /* 骑手 */
+                    kingName: kingName(p.Belong),        /* 君主（按城池/势力反查） */
+                    mine: p.Belong === myKing
+                });
             }
         }
         return pool;
     }
+
     /* 各势力拥有的马（AI 势力的马是"系统生成"的，含玩家未搜出的在野马）。
        规则：势力越大马越多；同一个势力不会有多匹同名马。 */
     /* 各势力拥有的马（AI 势力的马 = 系统生成，含玩家搜不到的「在野马」）。
@@ -4059,85 +4184,6 @@
          ② **稳定** —— 之前每次调用都重新随机，同一个势力每届的马都在变。
             现在分配结果**持久化**（跟存档槽走），只有换代（新存档）才重新分配。
        规则：马数 = min(城池数, 5)，按城池数分配。 */
-    var RACE_HORSE_KEY = 'baye_cheat_racehorses_v1';
-    var RACE_HORSES = null;
-    function loadRaceHorses() {
-        if (RACE_HORSES) return RACE_HORSES;
-        RACE_HORSES = {};
-        try {
-            var raw = localStorage.getItem(skey('racehorses_v1'));
-            if (raw) RACE_HORSES = JSON.parse(raw) || {};
-        } catch (e) { RACE_HORSES = {}; }
-        return RACE_HORSES;
-    }
-    function saveRaceHorses() {
-        try { localStorage.setItem(skey('racehorses_v1'), JSON.stringify(RACE_HORSES)); } catch (e) { }
-    }
-    function raceKingMounts() {
-        var store = loadRaceHorses();
-        var cities = baye.data.g_Cities, kings = [], i, k;
-        /* ① 收集现存势力 */
-        var exist = {};
-        for (i = 0; i < cities.length; i++) {
-            if (!cities[i]) continue;
-            k = cities[i].Belong;
-            if (k <= 0 || k === WILD || k === CAPTIVE) continue;
-            if (!exist[k]) { exist[k] = 1; kings.push(k); }
-        }
-        /* ② 已分配的��（全局唯一的关键） */
-        var used = {};
-        for (k in store) {
-            if (!store.hasOwnProperty(k)) continue;
-            for (i = 0; i < store[k].length; i++) used[store[k][i]] = 1;
-        }
-        /* ③ 新出现的势力：一次性分配，之后永不改动 */
-        var names = MOUNT_NAMES.slice();
-        var free = [];
-        for (i = 0; i < names.length; i++) if (!used[names[i]]) free.push(names[i]);
-        var changed = false;
-        for (i = 0; i < kings.length; i++) {
-            k = kings[i];
-            if (store[k] && store[k].length) continue;         /* 已分配过，跳过 */
-            var want = Math.max(1, Math.min(5, ownCities(k).length));
-            var pick = [];
-            for (var j = 0; j < want && free.length; j++) {
-                /* 偏向快马：70% 概率从「移动力≥2」里抽，30% 从全部里抽 */
-                var fast = [], all = [], t, m;
-                for (t = 0; t < free.length; t++) {
-                    m = MOUNT_MV[free[t]] || 1;
-                    all.push(free[t]);
-                    if (m >= 2) fast.push(free[t]);
-                }
-                var src = (fast.length && Math.random() < 0.7) ? fast : all;
-                if (!src.length) break;
-                var idx = rand(src.length), nm2 = src.splice(idx, 1)[0];
-                var at = free.indexOf(nm2);
-                if (at >= 0) free.splice(at, 1);
-                pick.push(nm2);
-                used[nm2] = 1;
-            }
-            store[k] = pick;
-            changed = true;
-        }
-        if (changed) saveRaceHorses();
-        /* ④ 清掉已灭亡势力的记录（避免脏数据占着马名） */
-        var stale = [];
-        for (k in store) {
-            if (!store.hasOwnProperty(k)) continue;
-            if (!exist[k]) stale.push(k);
-        }
-        for (i = 0; i < stale.length; i++) {
-            delete store[stale[i]];
-            changed = true;
-        }
-        if (changed) saveRaceHorses();
-        /* ⑤ 只返回现存势力的 */
-        var out = {};
-        for (i = 0; i < kings.length; i++) {
-            if (store[kings[i]]) out[kings[i]] = store[kings[i]].slice();
-        }
-        return out;
-    }
 
     /* ---------- 马匹状态（持久化，跟存档槽）---------- */
     var RACE_STATE_KEY = 'baye_cheat_racestate_v1';

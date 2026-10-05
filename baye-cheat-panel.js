@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.20.4';
+    var CHEAT_VERSION = '1.20.5';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -1825,6 +1825,37 @@
         /* 资源防截断：此刻引擎上个月的月结已跑完，钱被削到了 30000。
            与上月末记录的额度对比，若确认是被削（非玩家自己花掉）就补回。*/
         try { restoreResIfClamped(); } catch (e) { }
+        /* ★ 上个月末的赛况：在这里弹（v1.20.5）。
+           月末不弹（会被引擎结算 UI 抢掉），改为「存下来 → 下个月月初弹」。
+           读档进来时也要补弹（onDidLoadGame 里会调 tacticStage1）。
+           用 setTimeout 只是为了让引擎先完成自己的界面切换；
+           ★但仍走 uiQueue 串行，避免与其他弹窗撞。 */
+        try {
+            var pendRaw = null;
+            try { pendRaw = localStorage.getItem(skey('racepending_v1')); } catch (e9) { }
+            if (pendRaw) {
+                var pend = null;
+                try { pend = JSON.parse(pendRaw); } catch (e10) { }
+                /* 只弹一次：清掉缓存后才弹 */
+                try { localStorage.removeItem(skey('racepending_v1')); } catch (e11) { }
+                if (pend && pend.anim && pend.anim.length) {
+                    var py = pend.y, pm = pend.m;
+                    var nowY = baye.data.g_YearDate || 0, nowM = baye.data.g_MonthDate || 0;
+                    /* 只在「确实跨到了下个月」时弹，避免读档反复弹 */
+                    if (nowY !== py || nowM !== pm) {
+                        setTimeout(function () {
+                            uiQueue(function (next) {
+                                try {
+                                    playRaceAnim(pend.anim, pend.lines, function () {
+                                        next && next();
+                                    });
+                                } catch (e12) { next && next(); }
+                            });
+                        }, 600);
+                    }
+                }
+            }
+        } catch (e13) { }
         /* 赛马提醒：距下届 ≤1 个月时弹一次（各赛季只提醒一次）。
            ★ 不用 setTimeout —— 在setTimeout 里调 baye.alert 会在引擎 UI 状态机
            之外异步弹窗，引擎此时可能在处理自己的回调栈，导致
@@ -2942,11 +2973,14 @@
                     RACE_ENTRY = [];                        /* 本届结束清空报名 */
                     /* 结果写月报（月报是文字版）+ 弹窗（动画版，一次只显示一段） */
                     notes = notes.concat(rr.lines || []);
-                    /* 走 UI 队列：避免与同月其他弹窗（提醒/自检）撞在一起 */
-                    uiQueue(function (next) {
-                        try { playRaceAnim(rr.anim || [], rr.lines || [], next); }
-                        catch (e5) { log('赛马弹窗失败', e5); next && next(); }
-                    });
+                    /* ★ 不在月末弹窗（v1.20.5）：
+                       tacticStage5 期间引擎正在结算、UI 队列会被结算界面抢占，
+                       表现为「历届冠军有数据但什么都没弹」。
+                       改成：月末只记录（写月报 + 存赛况），弹窗挪到**下个月月初**。*/
+                    PENDING_RACE_SHOW = { anim: rr.anim || [], lines: rr.lines || [] };
+                    try { localStorage.setItem(skey('racepending_v1'),
+                        JSON.stringify({ y: baye.data.g_YearDate, m: baye.data.g_MonthDate,
+                            anim: PENDING_RACE_SHOW.anim, lines: PENDING_RACE_SHOW.lines })); } catch (e8) { }
                 }
             }
         } catch (e4) { log('赛马大会异常', e4); }
@@ -3148,49 +3182,24 @@
     function safeName(id) {
         try { return baye.getPersonNameByID(id); } catch (e) { return '-'; }
     }
-    /* ---------- 势力君主查询（v1.20.4 重写）----------
-       引擎里的确定事实（源码实证）：
-         city.SatrapId == g_PlayerKing + 1   ⇔  这座城是「君主所在城」
-         city.SatrapId = personID + 1（新建城时写入）
-       所以君主 = 「SatrapId 对得上」的那座城里的君主。
-       之前的错法：假设「君主下标 = 势力编号 - 1」—— 势力编号是行政编号（1,2,11,12…），
-       跟武将在 g_Persons 的下标毫无关系，必然查错。
-       现在按引擎的真实规则来：遍历城池找 SatrapId === king 的，再取该城里的君主。 */
-    /* 该势力的君主武将下标；找不到返回 -1 */
-    function kingPid(king) {
-        var k = Number(king);
-        var cities = baye.data.g_Cities, persons = baye.data.g_Persons;
-        var i, c, list, j, p;
-        /* ① 优先：找 SatrapId === king 的城（君主所在城） */
-        for (i = 0; i < cities.length; i++) {
-            c = cities[i];
-            if (!c || c.Belong !== k) continue;
-            if (c.SatrapId !== k) continue;                 /* 不是君主所在城 */
-            list = personsOfCity(i);
-            for (j = 0; j < list.length; j++) {
-                p = personAt(list[j]);
-                if (!p || p.Belong !== k) continue;
-                if (p.Level <= 0) continue;
-                return list[j];                             /* 君主所在城里的第一个本势力武将 */
-            }
-        }
-        /* ② 兜底：全势力扫，取等级最高者 */
-        var best = -1, bestLv = -1;
-        for (i = 0; i < persons.length; i++) {
-            p = persons[i];
-            if (!p || p.Level <= 0 || p.Belong !== k) continue;
-            if (p.Belong === WILD || p.Belong === CAPTIVE) continue;
-            if (p.Level > bestLv) { bestLv = p.Level; best = i; }
-        }
-        return best;
-    }
-    /* 势力编号 → 君主名字 */
+    /* ---------- 势力君主名（v1.20.5 定稿）----------
+       ★ 直接用 safeName(势力编号) —— 引擎的 getPersonNameByID 对「势力编号」
+         和「武将下标」是两套映射，传势力编号会返回该势力的君主名。
+         「势力分布」面板一直显示正确，就是因为它用的就是 safeName(city.Belong)。
+       v1.20.1~1.20.4 我误以为 safeName 只认武将下标，于是自己造了个
+       kingPid 去猜君主（先猜下标=势力-1，又改成遍历取等级最高、又改成按
+       SatrapId 找城里第一个武将）—— 全是错的：
+         · 洛阳的君主是董卓，但「城里第一个武将」是张辽 → 显示出「张辽」
+         · 走等级最高会选中张辽/李瑁这类猛将 → 显示出「李瑁」
+       教训：**先找到项目里已经在用对的写法（势力分布），照抄，不要自己造轮子。 */
     function kingName(king) {
         try {
-            var pid = kingPid(king);
-            return pid >= 0 ? nameOf(pid) : ('势力' + king);
+            var nm = safeName(king);
+            return (nm && nm !== '-' && nm !== '0') ? nm : ('势力' + king);
         } catch (e) { return '势力' + king; }
     }
+    /* 兼容旧调用：君主下标不再需要，但保留函数避免别处报错 */
+    function kingPid(king) { return -1; }
 
     function rankBy(field) {
         var persons = baye.data.g_Persons, arr = [], i;
@@ -4097,6 +4106,7 @@
     var RACE_HISTORY = [];      /* 历届冠军{season,name,king,date} */
     var RACE_LAST_HELD = -1;    /* 上次举办的赛季号（给 api 诊断用） */
     var RACE_LAST_MD = -1;       /* 上次举办的月份号（1~12），同月绝不重复办 */
+    var PENDING_RACE_SHOW = null;  /* 上月末存下的赛况，等下个月月初弹 */
     var RACE_COUNT = 0;          /* 累计举办届数 */
     var RACE_REMIND_SEASON = -1;  /* 上次提醒过的赛季号，避免每月重复弹提醒 */
     function raceSeason() { return Math.floor(gameMonthIndex() / 3); }
@@ -4231,16 +4241,30 @@
             if (!byKing[m.king]) byKing[m.king] = [];
             byKing[m.king].push(m);
         });
-        var entries = [];
+        var entries = [], all = [];
         for (var k in byKing) {
             if (!byKing.hasOwnProperty(k)) continue;
             var list = byKing[k];
-            if (Math.random() > 0.7) continue;                 /* 每势力 70% 概率参加 */
             var n = 1 + rand(Math.min(3, list.length));
             list.sort(function (a, b) { return b.mv - a.mv; });
             var pick = list.slice(0, n);
             if (Math.random() < 0.25 && list.length > n) pick[0] = list[n];   /* 偶尔爆冷门 */
-            entries.push({ king: Number(k), horses: pick });
+            all.push({ king: Number(k), horses: pick });
+        }
+        /* ★ 参赛率：势力越多越可能有人弃权，但不能「全军覆没」。
+           v1.20.5 前是每势力独立 70% 概率 → 2 个势力时两人都弃权 = 无人参赛，
+           于是月末该办赛却静默跳过（玩家看到「没显示」）。
+           现在：先按 60% 逐个抽取，若一个都没中则强制让**跑得最快的那批**参加。 */
+        for (var i = 0; i < all.length; i++) {
+            if (Math.random() < 0.6) entries.push(all[i]);
+        }
+        if (!entries.length && all.length) {
+            all.sort(function (a, b) {
+                var am = a.horses[0] ? a.horses[0].mv : 0, bm = b.horses[0] ? b.horses[0].mv : 0;
+                return bm - am;
+            });
+            var n2 = Math.min(2, all.length);
+            for (var j = 0; j < n2; j++) entries.push(all[j]);   /* 兜底：至少 2 个势力参赛 */
         }
         return entries;
     }

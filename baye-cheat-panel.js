@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.20.2';
+    var CHEAT_VERSION = '1.20.3';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -197,6 +197,7 @@
                 raceHistory: function () { return RACE_HISTORY.slice(); },
                 feedStable: function () { feedStableDialog(); return true; },
                 selectRun: function () { return raceSelectRun(null); },
+                resetRaceRhythm: function () { RACE_LAST_HELD = -1; RACE_LAST_MD = -1; RACE_COUNT = 0; return true; },
                 selectDialog: function () { raceSelectDialog(); return true; },
                 kingName: function (k) { return kingName(k); },
                 raceMounts: function () { return myMounts(); },
@@ -724,6 +725,32 @@
        抛错后弹窗卡死、还弹原生错误框。这里做重试 + 自绘兜底，
        保证「提示」这件事不会把游戏卡住。 */
     var ALERT_RETRY = 0;
+    /* ---------- UI 队列：所有弹窗串行，绝不重叠 ----------
+       引擎的 baye.alert / centerChoose 内部共用一个回调栈 baye._cbs，
+       两个弹窗同时在飞（或在 setTimeout 里弹）会互相踩，
+       报「baye._cbs.pop() is not a function」——这是会破坏游戏状态的严重错误。
+       统一走这个队列：前一个弹窗关掉后才弹下一个。 */
+    var UI_Q = [], UI_Q_BUSY = 0;
+    function uiQueue(fn) {
+        if (typeof fn !== 'function') return;
+        UI_Q.push(fn);
+        uiQueuePump();
+    }
+    function uiQueuePump() {
+        if (UI_Q_BUSY) return;
+        var fn = UI_Q.shift();
+        if (!fn) return;
+        UI_Q_BUSY = 1;
+        var done = false;
+        function next() {
+            if (done) return;
+            done = true;
+            UI_Q_BUSY = 0;
+            uiQueuePump();
+        }
+        try { fn(next); } catch (e) { log('UI 队列异常', e); next(); }
+    }
+
     function alert2(msg) {
         var text = gbkSafe(msg);
         if (ALERT_RETRY > 3) { log('alert 多次失败，改用控制台输出：', text); return; }
@@ -1798,18 +1825,23 @@
         /* 资源防截断：此刻引擎上个月的月结已跑完，钱被削到了 30000。
            与上月末记录的额度对比，若确认是被削（非玩家自己花掉）就补回。*/
         try { restoreResIfClamped(); } catch (e) { }
-        /* 赛马提醒：1/4/7/10 月（赛马月的上一个月）提示玩家去报名 */
+        /* 赛马提醒：距下届 ≤1 个月时弹一次（各赛季只提醒一次）。
+           ★ 不用 setTimeout —— 在setTimeout 里调 baye.alert 会在引擎 UI 状态机
+           之外异步弹窗，引擎此时可能在处理自己的回调栈，导致
+           baye._cbs.pop() 返回 undefined → TypeError（用户截图里的报错，会破坏游戏状态）。
+           改成：把提醒塞进 UI 队列，由队列在安全时机（tacticStage5 末尾）串行弹出。 */
         try {
-            /* 赛马提醒：距下届 ≤1 个月时弹一次（各赛季只提醒一次） */
-            if (flag('raceOn') && myMounts().length && raceNextMonths() <= 1
-                && RACE_REMIND_SEASON !== raceSeason()) {
-                RACE_REMIND_SEASON = raceSeason();
-                setTimeout(function () {
-                    var msg = '下个月有赛马大会！\n'
+            /* 只在 2/5/8/11 月提醒（下一个月的月末正好是赛马月） */
+            var mdR = baye.data.g_MonthDate || 0;
+            var isPreRace = (mdR % 3 === 2)&& (mdR > 0);
+            if (flag('raceOn') && myMounts().length && isPreRace
+                && RACE_REMIND_SEASON !== mdR) {
+                RACE_REMIND_SEASON = mdR;
+                uiQueue(function () {
+                    alert2('下个月有赛马大会！\n'
                         + '现在可以去【马厩】报名（选马 + 交粮草报名费）。\n'
-                        + '冠军奖金 ' + RACE_PRIZE[0] + ' 金，不报名就拿不到。';
-                    try { baye.alert(gbkSafe(msg), function () { }); } catch (e6) { }
-                }, 500);
+                        + '冠军奖金 ' + RACE_PRIZE[0] + ' 金，不报名就拿不到。');
+                });
             }
         } catch (e7) { }
         /* AI 势力自主强化：让他们用各自的钱强化自己的武将（平衡：玩家不会被单方面碾压） */
@@ -2789,17 +2821,31 @@
            现在月末弹窗播报「赛况动画 + 完整排名」，弹窗点确认后才回到游戏。*/
         try {
             if (flag('raceOn')) {
-                /* ★ 不再用 g_MonthDate % 3 判断：月末时引擎还没月结，
-                   g_MonthDate 仍是「当月」，导致 2 月末判断「不是 3 的倍数」而永远不办。
-                   改为「按赛季号办」，RACE_LAST_HELD 记录上次赛季，每届间隔 1 个赛季（3 个月）。 */
-                if (RACE_LAST_HELD !== raceSeason()
-                    && (RACE_LAST_HELD < 0 || raceSeason() - RACE_LAST_HELD >= 1)) {
+                /* ★★ 月末时序（v1.20.3 修，用户实测「2、3 月都举办、次年 2 月报错」）：
+                     tacticStage5 跑在引擎月结**之前**，所以此刻 g_MonthDate 还是「当月」。
+                     而 raceSeason() 用的是 gameMonthIndex()（含 g_MonthDate）——
+                     于是 2 月末时 season 已经跨到下一届，判定「该办」，
+                     结果变成 **2/5/8/11 月末**举办（玩家看到的就是「2 月也办」）。
+                   正确做法：赛季号要用「**下一个月**」算，即 (md + 1) 对齐 3/6/9/12 月末。
+                   例：2 月末 → seasonOf(3) → floor(3/3)=1；3 月末 → seasonOf(4)=1 → 与上次相同 → 不办。*/
+                /* ★ 用「显式赛马月」判断（v1.20.3 定稿）：
+                   tacticStage5 跑在引擎月结之前，g_MonthDate 就是当月 —— 所以
+                   直接判 md % 3 === 0（即 3/6/9/12 月末）最直白、最不会错。
+                   之前用赛季号 floor((mk+1)/3) 是错的：赛季号在季首月就跳变，
+                   导致 2/5/8/11 月末被误判成「新赛季开始」而提前办赛。
+                   RACE_COUNT 做二次兜底：同一个月绝不可能办两届。 */
+                var md = baye.data.g_MonthDate || 0;
+                if (md > 0 && md % 3 === 0 && RACE_LAST_MD !== md) {
                     var rr = raceRunOne(raceSeason());
+                    RACE_LAST_MD = md;                      /* 记录本月（防重复） */
                     RACE_ENTRY = [];                        /* 本届结束清空报名 */
                     /* 结果写月报（月报是文字版）+ 弹窗（动画版，一次只显示一段） */
                     notes = notes.concat(rr.lines || []);
-                    try { playRaceAnim(rr.anim || [], rr.lines || []); }
-                    catch (e5) { log('赛马弹窗失败', e5); }
+                    /* 走 UI 队列：避免与同月其他弹窗（提醒/自检）撞在一起 */
+                    uiQueue(function (next) {
+                        try { playRaceAnim(rr.anim || [], rr.lines || [], next); }
+                        catch (e5) { log('赛马弹窗失败', e5); next && next(); }
+                    });
                 }
             }
         } catch (e4) { log('赛马大会异常', e4); }
@@ -3002,18 +3048,32 @@
         try { return baye.getPersonNameByID(id); } catch (e) { return '-'; }
     }
     /* 势力编号 → 君主名字。
-       ★不能直接用 safeName(king)：它把参数当「武将下标」传给 getPersonNameByID，
-       而势力编号（如 11/12）恰好落在别的武将下标上 → 显示成陌生武将的名字
-       （用户截图：赤兔在吕布身上，却显示「孙坚」—— 吕布效忠董卓，king=12 查到了孙坚）。
-       君主下标 = 势力编号 - 1（与 smartPlan 里 kingIdx = king - 1 一致）。 */
+       ★ 不能假设「君主下标 = 势力编号 - 1」：势力编号是行政编号（1,2,11,12…），
+         跟武将在g_Persons 里的下标毫无关系 —— 那是 v1.20 的bug，
+         导致「赤兔在刘岱身上却显示成别的势力君主」，而且每局都不一样。
+       ★ 引擎里唯一可靠的线索：君主满级（Level 满）且是本势力唯一满级者。
+         所以遍历该势力所有武将，取 Level 最高者；同级则取武力+智力更高的。 */
+    function kingPid(king) {
+        var k = Number(king);
+        var persons = baye.data.g_Persons, best = -1, bestLv = -1, bestPw = -1, i, p, lv, pw;
+        for (i = 0; i < persons.length; i++) {
+            p = persons[i];
+            if (!p || !p.Level || p.Level <= 0) continue;
+            if (p.Belong !== k) continue;
+            if (p.Belong === WILD || p.Belong === CAPTIVE) continue;
+            lv = p.Level;
+            pw = (p.Force || 0) + (p.IQ || 0);
+            if (lv > bestLv || (lv === bestLv && pw > bestPw)) {
+                bestLv = lv; bestPw = pw; best = i;
+            }
+        }
+        return best;
+    }
     function kingName(king) {
-        var k = Number(king) - 1;
-        if (k < 0) return '势力' + king;
         try {
-            var p = baye.data.g_Persons[k];
-            if (p && p.Level > 0 && p.Belong === Number(king)) return nameOf(k);
-        } catch (e) { }
-        return '势力' + king;
+            var pid = kingPid(king);
+            return pid >= 0 ? nameOf(pid) : ('势力' + king);
+        } catch (e) { return '势力' + king; }
     }
 
     function rankBy(field) {
@@ -3919,9 +3979,18 @@
 
     var RACE_SEASON = 0;        /* 赛季号（每 3 个月 +1） */
     var RACE_HISTORY = [];      /* 历届冠军{season,name,king,date} */
-    var RACE_LAST_HELD = -1;    /* 上次举办的赛季号，避免同赛季重复发奖 */
+    var RACE_LAST_HELD = -1;    /* 上次举办的赛季号（给 api 诊断用） */
+    var RACE_LAST_MD = -1;       /* 上次举办的月份号（1~12），同月绝不重复办 */
+    var RACE_COUNT = 0;          /* 累计举办届数 */
     var RACE_REMIND_SEASON = -1;  /* 上次提醒过的赛季号，避免每月重复弹提醒 */
     function raceSeason() { return Math.floor(gameMonthIndex() / 3); }
+    /* 月末专用赛季号：月末时引擎还没月结，用「下一个月」算，
+       这样 2 月末算出的赛季号与 3 月末相同 → 只在 3/6/9/12 月末举办。 */
+    function raceSeasonAfter(md) {
+        /* 用「下一个月」算赛季号，且正确处理跨年（12 月→ 次年 1 月）。
+           gameMonthIndex() = (年-190)×12 + 月，所以下个月 = +1 即可自动跨年。 */
+        return Math.floor((gameMonthIndex() + 1) / 3);
+    }
     function raceNextMonths() {
         var into = gameMonthIndex() % 3;
         return 3 - into;                     /* 距下届还有几月（1~3） */
@@ -3982,32 +4051,91 @@
     }
     /* 各势力拥有的马（AI 势力的马是"系统生成"的，含玩家未搜出的在野马）。
        规则：势力越大马越多；同一个势力不会有多匹同名马。 */
+    /* 各势力拥有的马（AI 势力的马 = 系统生成，含玩家搜不到的「在野马」）。
+       ★ 两个必须遵守的规则（v1.20.3 修）：
+         ① **全局唯一** —— 之前每个势力都从完整的 29 匹里随机抽，
+            于是「董卓有赤兔、公孙瓒也有赤兔」→ 同场出现两只赤兔。
+            现在改成：所有势力共享一个「已分配」集合，抽过的名字不再给别的势力。
+         ② **稳定** —— 之前每次调用都重新随机，同一个势力每届的马都在变。
+            现在分配结果**持久化**（跟存档槽走），只有换代（新存档）才重新分配。
+       规则：马数 = min(城池数, 5)，按城池数分配。 */
+    var RACE_HORSE_KEY = 'baye_cheat_racehorses_v1';
+    var RACE_HORSES = null;
+    function loadRaceHorses() {
+        if (RACE_HORSES) return RACE_HORSES;
+        RACE_HORSES = {};
+        try {
+            var raw = localStorage.getItem(skey('racehorses_v1'));
+            if (raw) RACE_HORSES = JSON.parse(raw) || {};
+        } catch (e) { RACE_HORSES = {}; }
+        return RACE_HORSES;
+    }
+    function saveRaceHorses() {
+        try { localStorage.setItem(skey('racehorses_v1'), JSON.stringify(RACE_HORSES)); } catch (e) { }
+    }
     function raceKingMounts() {
-        var out = {}, cities = baye.data.g_Cities, i, k, seen;
+        var store = loadRaceHorses();
+        var cities = baye.data.g_Cities, kings = [], i, k;
+        /* ① 收集现存势力 */
+        var exist = {};
         for (i = 0; i < cities.length; i++) {
             if (!cities[i]) continue;
             k = cities[i].Belong;
             if (k <= 0 || k === WILD || k === CAPTIVE) continue;
-            if (!out[k]) { out[k] = []; seen = {}; out[k]._seen = seen; }
+            if (!exist[k]) { exist[k] = 1; kings.push(k); }
         }
+        /* ② 已分配的��（全局唯一的关键） */
+        var used = {};
+        for (k in store) {
+            if (!store.hasOwnProperty(k)) continue;
+            for (i = 0; i < store[k].length; i++) used[store[k][i]] = 1;
+        }
+        /* ③ 新出现的势力：一次性分配，之后永不改动 */
         var names = MOUNT_NAMES.slice();
-        for (k in out) {
-            if (!out.hasOwnProperty(k)) continue;
-            var n = ownCities(Number(k)).length;        /* 马数 = 城池数（1~5匹） */
-            var want = Math.max(1, Math.min(5, n));
-            var seen = out[k]._seen;
-            var bag = names.slice();
-            for (i = 0; i < want && bag.length; i++) {
-                /* 随机抽马（大势力优先抽到快马） */
-                var idx = rand(bag.length);
-                var nm = bag.splice(idx, 1)[0];
-                if (seen[nm]) { i--; continue; }         /* 同势力不重复同名 */
-                seen[nm] = 1;
-                out[k].push(nm);
+        var free = [];
+        for (i = 0; i < names.length; i++) if (!used[names[i]]) free.push(names[i]);
+        var changed = false;
+        for (i = 0; i < kings.length; i++) {
+            k = kings[i];
+            if (store[k] && store[k].length) continue;         /* 已分配过，跳过 */
+            var want = Math.max(1, Math.min(5, ownCities(k).length));
+            var pick = [];
+            for (var j = 0; j < want && free.length; j++) {
+                /* 偏向快马：70% 概率从「移动力≥2」里抽，30% 从全部里抽 */
+                var fast = [], all = [], t, m;
+                for (t = 0; t < free.length; t++) {
+                    m = MOUNT_MV[free[t]] || 1;
+                    all.push(free[t]);
+                    if (m >= 2) fast.push(free[t]);
+                }
+                var src = (fast.length && Math.random() < 0.7) ? fast : all;
+                if (!src.length) break;
+                var idx = rand(src.length), nm2 = src.splice(idx, 1)[0];
+                var at = free.indexOf(nm2);
+                if (at >= 0) free.splice(at, 1);
+                pick.push(nm2);
+                used[nm2] = 1;
             }
+            store[k] = pick;
+            changed = true;
         }
-        /* 去掉临时字段 */
-        for (k in out) { if (out.hasOwnProperty(k)) delete out[k]._seen; }
+        if (changed) saveRaceHorses();
+        /* ④ 清掉已灭亡势力的记录（避免脏数据占着马名） */
+        var stale = [];
+        for (k in store) {
+            if (!store.hasOwnProperty(k)) continue;
+            if (!exist[k]) stale.push(k);
+        }
+        for (i = 0; i < stale.length; i++) {
+            delete store[stale[i]];
+            changed = true;
+        }
+        if (changed) saveRaceHorses();
+        /* ⑤ 只返回现存势力的 */
+        var out = {};
+        for (i = 0; i < kings.length; i++) {
+            if (store[kings[i]]) out[kings[i]] = store[kings[i]].slice();
+        }
         return out;
     }
 
@@ -4186,6 +4314,7 @@
         lines.push('  本届冠军：' + champ.nm + '（' + kingName(champ.king) + '）');
         RACE_SEASON = season;
         RACE_LAST_HELD = season;
+        RACE_COUNT++;
         RACE_HISTORY.unshift({ season: season, name: champ.nm, king: champ.king,
             date: monthKey().replace('-', '年') + '月' });
         if (RACE_HISTORY.length > 8) RACE_HISTORY.pop();

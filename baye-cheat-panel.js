@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.20.5';
+    var CHEAT_VERSION = '1.20.6';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -1825,37 +1825,8 @@
         /* 资源防截断：此刻引擎上个月的月结已跑完，钱被削到了 30000。
            与上月末记录的额度对比，若确认是被削（非玩家自己花掉）就补回。*/
         try { restoreResIfClamped(); } catch (e) { }
-        /* ★ 上个月末的赛况：在这里弹（v1.20.5）。
-           月末不弹（会被引擎结算 UI 抢掉），改为「存下来 → 下个月月初弹」。
-           读档进来时也要补弹（onDidLoadGame 里会调 tacticStage1）。
-           用 setTimeout 只是为了让引擎先完成自己的界面切换；
-           ★但仍走 uiQueue 串行，避免与其他弹窗撞。 */
-        try {
-            var pendRaw = null;
-            try { pendRaw = localStorage.getItem(skey('racepending_v1')); } catch (e9) { }
-            if (pendRaw) {
-                var pend = null;
-                try { pend = JSON.parse(pendRaw); } catch (e10) { }
-                /* 只弹一次：清掉缓存后才弹 */
-                try { localStorage.removeItem(skey('racepending_v1')); } catch (e11) { }
-                if (pend && pend.anim && pend.anim.length) {
-                    var py = pend.y, pm = pend.m;
-                    var nowY = baye.data.g_YearDate || 0, nowM = baye.data.g_MonthDate || 0;
-                    /* 只在「确实跨到了下个月」时弹，避免读档反复弹 */
-                    if (nowY !== py || nowM !== pm) {
-                        setTimeout(function () {
-                            uiQueue(function (next) {
-                                try {
-                                    playRaceAnim(pend.anim, pend.lines, function () {
-                                        next && next();
-                                    });
-                                } catch (e12) { next && next(); }
-                            });
-                        }, 600);
-                    }
-                }
-            }
-        } catch (e13) { }
+        /* 上月赛况：月初展示 */
+        try { tryShowPendingRace(true); } catch (e0r) { }
         /* 赛马提醒：距下届 ≤1 个月时弹一次（各赛季只提醒一次）。
            ★ 不用 setTimeout —— 在setTimeout 里调 baye.alert 会在引擎 UI 状态机
            之外异步弹窗，引擎此时可能在处理自己的回调栈，导致
@@ -1870,7 +1841,7 @@
                 RACE_REMIND_SEASON = mdR;
                 uiQueue(function () {
                     alert2('下个月有赛马大会！\n'
-                        + '现在可以去【马厩】报名（选马 + 交粮草报名费）。\n'
+                        + '现在可以去【御马监】报名（选马 + 交粮草报名费）。\n'
                         + '冠军奖金 ' + RACE_PRIZE[0] + ' 金，不报名就拿不到。');
                 });
             }
@@ -2903,6 +2874,8 @@
         return undefined;
     }
         setTimeout(function () { try { selfCheckFlags(); } catch (e) { } }, 800);
+        /* 上月赛况：读档时展示（tacticStage1 在读档时不会触发，必须在这里挂） */
+        setTimeout(function () { try { tryShowPendingRace(true); } catch (e) { } }, 1400);
 
     /* ---------- 启动自检：把「开关没生效」这类问题直接暴露在控制台 ----------
        教训（v1.20）：raceOn / aiForge 因为没写进 DEFAULT_CFG，flag() 一直返回falsy，
@@ -2981,6 +2954,7 @@
                     try { localStorage.setItem(skey('racepending_v1'),
                         JSON.stringify({ y: baye.data.g_YearDate, m: baye.data.g_MonthDate,
                             anim: PENDING_RACE_SHOW.anim, lines: PENDING_RACE_SHOW.lines })); } catch (e8) { }
+                    log('赛马：第' + (rr.lines && rr.lines.length ? '届' : '') + '已举办，赛况已存（下月月初展示）');
                 }
             }
         } catch (e4) { log('赛马大会异常', e4); }
@@ -3015,7 +2989,7 @@
 
     function onShowMainHelp() {
         var items = ['查看月报', '势力分布', '装备分布', '武力排行', '智力排行',
-            '宝物图鉴', '武将跟踪', '武将修复', '铁匠铺', '马厩', '资源管理', '显示版本'];
+            '宝物图鉴', '武将跟踪', '武将修复', '铁匠铺', '御马监', '资源管理', '显示版本'];
         var hasOrigin = !!wrappedHooks.showMainHelp;
         if (hasOrigin) items.push('原版帮助');
         /* 主菜单用小窗（56x66），和霸哥版手感一致 —— 别占满屏 */
@@ -3182,6 +3156,41 @@
     function safeName(id) {
         try { return baye.getPersonNameByID(id); } catch (e) { return '-'; }
     }
+    /* ---------- 上月赛况展示（v1.20.6）----------
+       之前挂在 tacticStage1 上，但**读档（onDidLoadGame）不会走 tacticStage1**，
+       所以玩家读档进来什么也看不到；而且当时「先清缓存再弹」，
+       一旦清了就永久丢失。
+       现在改成：
+         · 缓存**不提前删**，弹完（或玩家手动看过）才标记已展示
+         · 三个时机都会尝试展示：读档、月初、打开御马监
+         · 同一届只展示一次（用 shown标记，不会反复弹）
+         · 任何时机失败都不丢数据 */
+    function tryShowPendingRace(silent) {
+        try {
+            var raw = localStorage.getItem(skey('racepending_v1'));
+            if (!raw) return false;
+            var pend = null;
+            try { pend = JSON.parse(raw); } catch (e) { return false; }
+            if (!pend || !pend.anim || !pend.anim.length) return false;
+            if (pend.shown) return false;                /* 已展示过 */
+            var nowY = baye.data.g_YearDate || 0, nowM = baye.data.g_MonthDate || 0;
+            var crossMonth = (nowY !== pend.y || nowM !== pend.m);
+            /* 同月内（刚办完还没跨月）不弹，等跨月；读档回同月也不弹 */
+            if (!crossMonth) { if (!silent) { /* 静默等待 */ } return false; }
+            pend.shown = 1;
+            try { localStorage.setItem(skey('racepending_v1'), JSON.stringify(pend)); } catch (e2) { }
+            setTimeout(function () {
+                uiQueue(function (next) {
+                    try {
+                        var head = '━━━ 上月赛马回顾 ━━━';
+                        playRaceAnim([head].concat(pend.anim), pend.lines, function () { next && next(); });
+                    } catch (e3) { next && next(); }
+                });
+            }, 700);
+            return true;
+        } catch (e4) { return false; }
+    }
+
     /* ---------- 势力君主名（v1.20.5 定稿）----------
        ★ 直接用 safeName(势力编号) —— 引擎的 getPersonNameByID 对「势力编号」
          和「武将下标」是两套映射，传势力编号会返回该势力的君主名。
@@ -4138,7 +4147,7 @@
         var add = Math.min(800, room);
         if (add > 0) city.Money = (Number(city.Money) || 0) + add;
         alert2('粮草换钱：-500 粮　+' + add + ' 金（粮草剩 ' + (Number(city.Food) || 0) + '）');
-        log('马厩·粮换金：粮-' + 500 + ' 金+' + add);
+        log('御马监·粮换金：粮-' + 500 + ' 金+' + add);
     }
 
     /* ---------- 全局马池 ---------- */
@@ -4491,7 +4500,7 @@
         runners.forEach(function (r, i) { r.rank = i + 1; });
         /* 赛况（复用分段动画，措辞改成选拔赛） */
         var anim = [];
-        anim.push('━━ 马厩选拔赛 · 起跑 ━━\n\n'
+        anim.push('━━ 御马校场 · 起跑 ━━\n\n'
             + '　' + use.length + ' 匹马在都城赛场集合\n'
             + '　观众买票入场（门票 ' + SELECT_TICKET + ' 金/匹）\n'
             + '　今日赛事由你自己主持');
@@ -4512,7 +4521,7 @@
             + '　门票收入 +' + got + ' 金（' + use.length + ' 匹 × ' + SELECT_TICKET + '）\n\n'
             + '　（点确认查看全部排名）');
         /* 排名 + 奖金（选拔赛也发奖，但比大会低，只算门票为主） */
-        var lines = ['【选拔赛】马厩自办 · ' + use.length + ' 匹马 · 门票收入 +' + got + ' 金', ''];
+        var lines = ['【御马校场】' + use.length + ' 匹爱驹 · 门票收入 +' + got + ' 金', ''];
         runners.forEach(function (r) {
             lines.push('  第' + r.rank + '名  ' + pad(r.nm, 8) + ' 移动+' + r.mv + '  状态' + r.st.s
                 + (r.ev ? '  ⚠' + r.ev.txt : ''));
@@ -4538,7 +4547,7 @@
         if (pool.length < 2) { alert2('至少要有 2 匹马才能办选拔赛。\n（当前 ' + pool.length + ' 匹，去收集赤兔/的卢 等战马）'); return; }
         var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
         var have = city ? (Number(city.Money) || 0) : 0;
-        var lines = ['【马厩选拔赛】你自己的马互跑 · 收门票 · 每月一次',
+        var lines = ['【御马校场】爱驹同场竞技 · 收门票 · 每月一次',
             '门票 ' + SELECT_TICKET + ' 金/匹（观众付费，直接进你的都城金库）', ''];
         pool.forEach(function (m, i) {
             var st = mountState(myKing, m.nm);
@@ -4566,6 +4575,8 @@
     }
 
     function stableDialog() {
+        /* 打开御马监时补展示上月赛况（读档/月初都没弹出来的兜底） */
+        try { tryShowPendingRace(true); } catch (e1r) { }
         var myKing = (baye.data.g_PlayerKing || 0) + 1;
         var persons = baye.data.g_Persons, rows = [], seen = {}, i, s, tid0, t, nm, mv;
         for (i = 0; i < persons.length; i++) {
@@ -4588,7 +4599,7 @@
             }
         }
         rows.sort(function (a, b) { return b.mv - a.mv || (a.nm < b.nm ? -1 : 1); });
-        var lines = ['马厩 · 共有 ' + rows.length + ' 匹（登记在册 ' + Object.keys(seen).length + ' 种）',
+        var lines = ['御马监 · 共有 ' + rows.length + ' 匹（登记在册 ' + Object.keys(seen).length + ' 种）',
             '按移动力排序',
             ''];
         if (!rows.length) {
@@ -4638,7 +4649,7 @@
         lines.push('');
         lines.push('① 报名赛马大会（各势力同场竞技，冠军 ' + RACE_PRIZE[0] + ' 金）');
         lines.push('② 喂马：花 100 粮草提升状态（上限 100，可治病）');
-        lines.push('③ 马厩选拔赛：自己的马互跑，每匹收门票 ' + SELECT_TICKET + ' 金（每月一次）');
+        lines.push('③ 御马校场：爱驹同场竞技，每匹收门票 ' + SELECT_TICKET + ' 金（每月一次）');
         menu(lines, 0, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) return;
             var k = ind - actBase;
@@ -5360,7 +5371,7 @@
         { k: 'noResCap', t: '资源防截断', d: '默认开启。引擎每月结算会把金币削到 30000；本项只在检测到「被削到 30000」时补回原额度（你自己花掉的钱不会补）。粮草被引擎溢出归零时也会补回' },
         { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（等级不设上限），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
         { k: 'forgePity', t: '强化保底', d: '默认开启。连续失败 8 次后下一次必定成功，避免高等级陷入无限掉级（+20 以上成功率仅 4%）' },
-        { k: 'raceOn', t: '赛马大会（每 3 个月）', d: '默认开启。每 3 个月（3/6/9/12 月）月末在都城自动举办，按坐骑移动力排名发奖金（第1名 1500 金，逐级递减到 200 金），奖金直接进都城金币用于强化。有马厩后可随时手动举办；马厩里还有「喂马」消耗 500 粮草换 800 金' },
+        { k: 'raceOn', t: '赛马大会（每 3 个月）', d: '默认开启。每 3 个月（3/6/9/12 月）月末在都城自动举办，按坐骑移动力排名发奖金（第1名 1500 金，逐级递减到 200 金），奖金直接进都城金币用于强化。可随时去【御马监】报名或手动举办；御马监里还能「喂马」提升马匹状态（花 100 粮草，状态 +6，可治病）' },
         { k: 'aiForge', t: 'AI 势力也会强化', d: '默认开启。每个 AI 势力用自己的城池收入强化自己的武将（花钱按玩家的 34% 计价、成功率低 8 个百分点、最高等级=城池数+6）。这样玩家 +20 时 AI 也在成长，不会单方面碾压；同时 AI 变强会消耗它的经济 → 出征变慢' },
         { k: 'levelBoost', t: '武将等级提升', d: '每月给全部己方武将 +30 经验（引擎经验条满 100 即升 1 级，等级上限由引擎 maxLevel 决定，默认 30）' },
         { k: 'forgeGuarantee', t: '强化必定成功', d: '默认关。开启后强化成功率强制 100%（费用照收），配合铁匠铺快速刷高等级用' },

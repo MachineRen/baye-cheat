@@ -4467,7 +4467,10 @@
        用途：给马厩里的马一个「展示 + 筛选」舞台（快马露脸多、慢马也能出风头），
              同时给玩家一条稳定的金币来源（自己的马跑，不花报名费，反而赚钱）。
        限制：至少 2 匹马才能办（1 匹马没有比赛意义）。 */
-    var SELECT_TICKET = 1000;        /* 每匹马门票（金） */
+    /* 御马校场（v1.21 纠正）：玩家势力内部自办赛。
+       ★ 门票是**观众付费**，与参赛马匹数量无关（原来错算成「马数 × 1000」）。
+       ★ 不自动举办，玩家手动点；每月最多一次。 */
+    var SELECT_TICKET = 1000;        /* 门票收入基数（金） */
     var SELECT_LAST_MONTH = -1;      /* 上次办选拔赛的月份序号，每月只能一次 */
     /* 办一场选拔赛。horseIdx 缺省 = 全部马。 */
     function raceSelectRun(horseIdx) {
@@ -4480,7 +4483,8 @@
         if (SELECT_LAST_MONTH === mk) { alert2('这个月已经办过选拔赛了，下个月再来。'); return null; }
         var use = horseIdx && horseIdx.length ? horseIdx.map(function (i) { return pool[i]; }) : pool;
         /* 门票：每匹1000（观众付费 → 进你口袋） */
-        var ticket = use.length * SELECT_TICKET;
+        /* 门票 = 观众付费，与马匹数量无关；满场（3匹）多卖 500 */
+        var ticket = SELECT_TICKET + (use.length >= 3 ? 500 : 0);
         var room = Math.max(0, 30000 - (Number(city.Money) || 0));
         var got = Math.min(ticket, room);
         city.Money = (Number(city.Money) || 0) + got;
@@ -4498,7 +4502,7 @@
         var anim = [];
         anim.push('━━ 御马校场 · 起跑 ━━\n\n'
             + '　' + use.length + ' 匹马在都城赛场集合\n'
-            + '　观众买票入场（门票 ' + SELECT_TICKET + ' 金/匹）\n'
+            + '　观众买票入场（门票 ' + SELECT_TICKET + ' 金）\n'
             + '　今日赛事由你自己主持');
         anim.push('　　━━发 令 ━━\n\n　砰！发令枪响——\n　' + use.length + ' 匹马冲出闸门！\n\n　起跑领先：' + runners[0].nm);
         var mid = runners.slice().sort(function (a, b) { return b.score * (0.85 + Math.random() * 0.3) - a.score * (0.85 + Math.random() * 0.3); });
@@ -4514,10 +4518,10 @@
             + '\n　　冲刺阶段：' + late[0].nm + '暂列第一');
         anim.push('　　━━ 冲 线 ━━\n\n'
             + '　🏆 冠军：' + runners[0].nm + '　（移动+' + runners[0].mv + ' 状态' + runners[0].st.s + '）\n'
-            + '　门票收入 +' + got + ' 金（' + use.length + ' 匹 × ' + SELECT_TICKET + '）\n\n'
+            + '　门票收入 +' + got + ' 金\n\n'
             + '　（点确认查看全部排名）');
         /* 排名 + 奖金（选拔赛也发奖，但比大会低，只算门票为主） */
-        var lines = ['【御马校场】' + use.length + ' 匹爱驹 · 门票收入 +' + got + ' 金', ''];
+        var lines = ['【御马校场】' + use.length + ' 匹参赛 · 门票 +' + got + ' 金', ''];
         runners.forEach(function (r) {
             lines.push('  第' + r.rank + '名  ' + pad(r.nm, 8) + ' 移动+' + r.mv + '  状态' + r.st.s
                 + (r.ev ? '  ⚠' + r.ev.txt : ''));
@@ -4544,11 +4548,11 @@
         var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
         var have = city ? (Number(city.Money) || 0) : 0;
         var lines = ['【御马校场】爱驹同场竞技 · 收门票 · 每月一次',
-            '门票 ' + SELECT_TICKET + ' 金/匹（观众付费，直接进你的都城金库）', ''];
+            '观众付门票 ' + SELECT_TICKET + ' 金', '（与马匹数量无关）', ''];
         pool.forEach(function (m, i) {
             var st = mountState(myKing, m.nm);
             lines.push('  [' + i + '] ' + pad(m.nm, 8) + ' 移动+' + m.mv + '　状态 ' + st.s
-                + (st.sick ? '（病）' : '') + '　门票 +' + SELECT_TICKET);
+                + (st.sick ? '（病）' : ''));
         });
         lines.push('');
         lines.push('  【全部出赛】（' + pool.length + ' 匹，门票 +' + (pool.length * SELECT_TICKET) + ' 金）');

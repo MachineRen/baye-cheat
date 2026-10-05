@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.19.0';
+    var CHEAT_VERSION = '1.20.0';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -196,6 +196,9 @@
                 raceEntry: function () { return RACE_ENTRY.slice(); },
                 raceHistory: function () { return RACE_HISTORY.slice(); },
                 feedStable: function () { feedStableDialog(); return true; },
+                selectRun: function () { return raceSelectRun(null); },
+                selectDialog: function () { raceSelectDialog(); return true; },
+                kingName: function (k) { return kingName(k); },
                 raceMounts: function () { return myMounts(); },
                 feedMounts: function () { feedMounts(); return true; },
                 resetWarRhythm: function () { WAR_LAST = {}; WAR_COUNT = {}; return true; },
@@ -1793,6 +1796,20 @@
         /* 资源防截断：此刻引擎上个月的月结已跑完，钱被削到了 30000。
            与上月末记录的额度对比，若确认是被削（非玩家自己花掉）就补回。*/
         try { restoreResIfClamped(); } catch (e) { }
+        /* 赛马提醒：1/4/7/10 月（赛马月的上一个月）提示玩家去报名 */
+        try {
+            if (flag('raceOn')) {
+                var nm2 = baye.data.g_MonthDate || 0;
+                if (nm2 % 3 === 1 && myMounts().length) {
+                    setTimeout(function () {
+                        var msg = '下个月（' + ((nm2 % 12) + 1) + '月）有赛马大会！\n'
+                            + '现在可以去【马厩】报名（选马 + 交粮草报名费）。\n'
+                            + '冠军奖金 ' + RACE_PRIZE[0] + ' 金，不报名就拿不到。';
+                        try { baye.alert(gbkSafe(msg), function () { }); } catch (e6) { }
+                    }, 400);
+                }
+            }
+        } catch (e7) { }
         /* AI 势力自主强化：让他们用各自的钱强化自己的武将（平衡：玩家不会被单方面碾压） */
         try { aiForgeAll(); } catch (e) { }
         var notes = [];
@@ -2401,7 +2418,7 @@
             if (moved.length >= 12) break;                 /* 每月调兵上限，避免天下大搬家 */
         }
         if (moved.length) {
-            log('回防：' + safeName(king) + '军 ' + moved.slice(0, 4).join('、')
+            log('回防：' + kingName(king) + ' ' + moved.slice(0, 4).join('、')
                 + (moved.length > 4 ? ' 等 ' + moved.length + ' 人' : ''));
         }
         refresh();                                          /* 调兵后重新评估 */
@@ -2460,7 +2477,7 @@
                 WAR_COUNT[king] = (WAR_COUNT[king] || 0) + 1;
                 /* 记下目标，用于月末核对「出征后是否真的打了这一仗」 */
                 PENDING_SORTIE.push({ target: bestT, src: c, month: monthKey() });
-                log('出征：' + safeName(king) + '军 自 ' + cityName(c)
+                log('出征：' + kingName(king) + ' 自 ' + cityName(c)
                     + ' 出兵 ' + team.length + ' 将 攻 ' + cityName(bestT));
             }
         }
@@ -2686,7 +2703,7 @@
                 else if (r === -1) fail++;
             }
             if (got + fail > 0 && flag('verbose')) {
-                log('AI强化 ' + safeName(king) + '：成功 ' + got + ' 失败 ' + fail + '（等级上限 +' + capLv + '）');
+                log('AI强化 ' + kingName(king) + '：成功 ' + got + ' 失败 ' + fail + '（等级上限 +' + capLv + '）');
             }
         }
         saveForge();
@@ -2741,14 +2758,18 @@
         /* 出征结果核对：出征记录是决定出兵，战斗记录才是结果；对不上要说明 */
         try { notes = notes.concat(checkSortieResults() || []); } catch (e3) { }
         /* 赛马大会 v2：每 3 个月（3/6/9/12 月）月末自动举办。
-           玩家未报名 → 只看结果不发钱；报名了→ 按名次发奖金。*/
+           ★ 关键修复：原来只把结果塞进月报，玩家完全看不到（用户反馈「压根没举办」）。
+           现在月末弹窗播报「赛况动画 + 完整排名」，弹窗点确认后才回到游戏。*/
         try {
             if (flag('raceOn')) {
                 var md = baye.data.g_MonthDate || 0;
                 if (md % 3 === 0 && RACE_LAST_HELD !== raceSeason()) {
                     var rr = raceRunOne(raceSeason());
-                    notes = notes.concat(rr.lines || []);
                     RACE_ENTRY = [];                        /* 本届结束清空报名 */
+                    /* 结果写月报（月报是文字版）+ 弹窗（动画版，一次只显示一段） */
+                    notes = notes.concat(rr.lines || []);
+                    try { playRaceAnim(rr.anim || [], rr.lines || []); }
+                    catch (e5) { log('赛马弹窗失败', e5); }
                 }
             }
         } catch (e4) { log('赛马大会异常', e4); }
@@ -2949,6 +2970,20 @@
 
     function safeName(id) {
         try { return baye.getPersonNameByID(id); } catch (e) { return '-'; }
+    }
+    /* 势力编号 → 君主名字。
+       ★不能直接用 safeName(king)：它把参数当「武将下标」传给 getPersonNameByID，
+       而势力编号（如 11/12）恰好落在别的武将下标上 → 显示成陌生武将的名字
+       （用户截图：赤兔在吕布身上，却显示「孙坚」—— 吕布效忠董卓，king=12 查到了孙坚）。
+       君主下标 = 势力编号 - 1（与 smartPlan 里 kingIdx = king - 1 一致）。 */
+    function kingName(king) {
+        var k = Number(king) - 1;
+        if (k < 0) return '势力' + king;
+        try {
+            var p = baye.data.g_Persons[k];
+            if (p && p.Level > 0 && p.Belong === Number(king)) return nameOf(k);
+        } catch (e) { }
+        return '势力' + king;
     }
 
     function rankBy(field) {
@@ -4022,20 +4057,70 @@
         });
         runners.sort(function (a, b) { return b.score - a.score; });
         runners.forEach(function (r, i) { r.rank = i + 1; });
-        /* ③ 动画播报（赛况解说） */
-        var anim = [];
-        anim.push('━━ 第' + (season + 1) + '届赛马大会 ━━');
-        anim.push('发令枪响！' + runners.length + ' 匹马冲出闸门');
-        var lead = runners[0];
-        for (var q = 1; q < runners.length; q++) if (runners[q].score > lead.score) lead = runners[q];
-        anim.push('中段领先：' + lead.nm + '（' + safeName(lead.king) + '军）');
-        runners.forEach(function (r) { if (r.ev) anim.push('⚠ ' + safeName(r.king) + '军：' + r.ev.txt); });
-        anim.push('终点冲线！');
+        /* ③ 赛况动画：分 6 段推进，有领先易位、有超车、有事故，最后冲线。
+           每一段都是一条弹窗内容（引擎一次只显示一屏），点确认继续下一段 →
+           玩家能完整看完比赛过程，而不是"一闪而过的结果"。 */
+        var anim = [], seg, q, order, lead, prevLead;
+        order = runners.slice();
+        /* 按速度排（快马在前）作为起跑假设 */
+        order.sort(function (a, b) { return b.score - a.score; });
+        seg = '━━ 第' + (season + 1) + ' 届赛马大会· 起跑 ━━\n\n'
+            + '　赛前检录：' + order.length + ' 匹马入场\n'
+            + '　看台观众爆满，都城旌旗飘扬\n'
+            + '　各势力马夫牵马就位，骑手压低身形\n\n'
+            + '　（按「下一项」继续）';
+        anim.push(seg);
+        /* 第2 段：发令 */
+        seg = '　　━━发 令 ━━\n\n'
+            + '　砰！发令枪响——\n'
+            + '　' + order.length + ' 匹马如离弦之箭冲出闸门！\n\n'
+            + '　起跑阶段（快马抢位）\n'
+            + '　领先：' + order[0].nm + '（' + kingName(order[0].king) + '）\n'
+            + '　紧随：' + (order[1] ? order[1].nm : '—') + '、' + (order[2] ? order[2].nm : '—');
+        anim.push(seg);
+        /* 第3 段：中途加速 + 可能的事故 */
+        var mid = order.slice().sort(function (a, b) { return b.score * (0.85 + Math.random() * 0.3) - a.score * (0.85 + Math.random() * 0.3); });
+        seg = '　　— 中段 —\n\n';
+        /* 随机一匹在事故里（如果有） */
+        var accident = null;
+        for (q = 0; q < mid.length; q++) if (mid[q].ev) { accident = mid[q]; break; }
+        if (accident) {
+            seg += '　⚡ ' + accident.nm + ' 出状况！' + accident.ev.txt + '\n';
+            seg += '　　　（' + kingName(accident.king) + '的马夫在场边急得直跳）\n';
+        } else {
+            seg += '　中段节奏稳健，暂无意外\n';
+        }
+        seg += '\n　　中段领先：' + mid[0].nm + '（' + kingName(mid[0].king) + '）';
+        if (mid[0].ev) seg += '　⚠ 带着伤在跑！';
+        anim.push(seg);
+        /* 第 4 段：易位 / 超车 */
+        var late = runners.slice().sort(function (a, b) { return (b.score + (Math.random() - 0.5) * 20) - (a.score + (Math.random() - 0.5) * 20); });
+        seg = '　　— 最后冲刺 —\n\n';
+        if (mid[0] && late[0] && late[0].nm !== mid[0].nm) {
+            seg += '　🔥 ' + late[0].nm + ' 突然加速！强行超车——\n';
+            seg += '　　反超 ' + late[0].nm + ' → ' + mid[0].nm + '\n';
+        } else {
+            seg += '　格局未变，领先者死死守住\n';
+        }
+        seg += '\n　　冲刺阶段：' + late[0].nm + '暂列第一';
+        anim.push(seg);
+        /* 第 5 段：最后 100 米 */
+        seg = '　　— 最后 100 米 —\n\n'
+            + '　看台沸腾！\n'
+            + '　' + late[0].nm + ' 咬牙冲刺，'+ (late[1] ? late[1].nm + ' 在身后紧咬！' : '后方紧追！') + '\n';
+        anim.push(seg);
+        /* 第 6 段：冲线 + 结果概要（详细排名在下一段） */
+        seg = '　　━━ 冲 线 ━━\n\n'
+            + '　🏆 冠军：' + runners[0].nm + '！（' + kingName(runners[0].king) + '）\n'
+            + '　亚军：' + (runners[1] ? runners[1].nm : '—') + '\n'
+            + '　季军：' + (runners[2] ? runners[2].nm : '—') + '\n\n'
+            + '　（点确认查看全部排名）';
+        anim.push(seg);
         /* 结果：列全排名 + 标注异常 */
         var lines = ['【赛马】第' + (season + 1) + '届 · ' + runners.length + ' 匹马', ''];
         runners.forEach(function (r) {
             lines.push('  第' + r.rank + '名  ' + pad(r.nm, 8) + ' 移动+' + r.mv
-                + '  状态' + r.st.s + '  ' + safeName(r.king) + '军'
+                + '  状态' + r.st.s + '  ' + kingName(r.king) + '（' + (r.mine ? '你' : '') + '）'
                 + (r.ev ? '  ⚠' + r.ev.txt : ''));
         });
         var got = 0, pri = [];
@@ -4066,7 +4151,7 @@
         else got = 0;
         if (pri.length) { lines.push(''); lines.push('  你的奖金：'); pri.forEach(function (p) { lines.push('   ' + p); }); }
         lines.push('');
-        lines.push('  本届冠军：' + champ.nm + '（' + safeName(champ.king) + '军）');
+        lines.push('  本届冠军：' + champ.nm + '（' + kingName(champ.king) + '）');
         RACE_SEASON = season;
         RACE_LAST_HELD = season;
         RACE_HISTORY.unshift({ season: season, name: champ.nm, king: champ.king,
@@ -4102,12 +4187,140 @@
             alert2(r.msg + '　（粮草 -100，剩 ' + (Number(city.Food) || 0) + '）');
         });
     }
-    /* 立即举办一届：先播动画（逐条 alert），再给完整排名 */
+    /* ③ 串行播赛况：一次只显示一屏，点确认继续下一段 → 完整看完比赛过程 */
+    function playRaceAnim(anim, lines, onDone) {
+        var segs = anim.slice();
+        segs.push('');                       /* 空行分隔 */
+        segs = segs.concat(lines);           /* 最后接完整排名 */
+        var i = 0;
+        function next() {
+            if (i >= segs.length) { if (onDone) { try { onDone(); } catch (e) { } } return; }
+            var txt = segs[i++];
+            if (!txt) { next(); return; }
+            var more = i < segs.length ? '\n\n（下按继续 · ' + i + '/' + segs.length + '）' : '\n\n（本条结束）';
+            try {
+                baye.alert(gbkSafe(txt + more), function () { next(); });
+            } catch (e) { if (onDone) { try { onDone(); } catch (e2) { } } }
+        }
+        next();
+    }
+
+    /* 立即举办一届：先播动画（逐段 alert），再给完整排名 */
     function raceRunNowDialog() {
         var season = raceSeason();
         var res = raceRunOne(season);
-        var all = res.anim.concat(['']).concat(res.lines);
-        try { baye.alert(gbkSafe(all.join('\n')), function () { stableDialog(); }); } catch (e) { alert2(all.join('\n')); }
+        playRaceAnim(res.anim || [], res.lines || [], function () { stableDialog(); });
+    }
+
+    /* ---------- ② 马厩选拔赛（玩家自己的马互跑，收门票）----------
+       与「赛马大会」的区别：
+         · 赛马大会 = 各势力出马，系统每 3 个月办一次，玩家要报名+交粮草报名费
+         · **选拔赛   = 只用你自己马厩的马互跑**，每月可办一次，**收门票**（观众付费）
+       门票：每匹马1000 金（马越多收得越多）。
+       用途：给马厩里的马一个「展示 + 筛选」舞台（快马露脸多、慢马也能出风头），
+             同时给玩家一条稳定的金币来源（自己的马跑，不花报名费，反而赚钱）。
+       限制：至少 2 匹马才能办（1 匹马没有比赛意义）。 */
+    var SELECT_TICKET = 1000;        /* 每匹马门票（金） */
+    var SELECT_LAST_MONTH = -1;      /* 上次办选拔赛的月份序号，每月只能一次 */
+    /* 办一场选拔赛。horseIdx 缺省 = 全部马。 */
+    function raceSelectRun(horseIdx) {
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
+        if (!city) { alert2('没有都城。'); return null; }
+        var pool = raceMountPool().filter(function (m) { return m.king === myKing; });
+        if (pool.length < 2) { alert2('至少要有 2 匹马才能办选拔赛。\n（当前 ' + pool.length + ' 匹）'); return null; }
+        var mk = gameMonthIndex();
+        if (SELECT_LAST_MONTH === mk) { alert2('这个月已经办过选拔赛了，下个月再来。'); return null; }
+        var use = horseIdx && horseIdx.length ? horseIdx.map(function (i) { return pool[i]; }) : pool;
+        /* 门票：每匹1000（观众付费 → 进你口袋） */
+        var ticket = use.length * SELECT_TICKET;
+        var room = Math.max(0, 30000 - (Number(city.Money) || 0));
+        var got = Math.min(ticket, room);
+        city.Money = (Number(city.Money) || 0) + got;
+        SELECT_LAST_MONTH = mk;
+        /* 评分+ 排名（规则与大会一致：移动力 + 状态 + 随机事件） */
+        var runners = use.map(function (m) {
+            var st = mountState(myKing, m.nm);
+            var ev = raceEvent(m, st);
+            return { king: myKing, nm: m.nm, mv: m.mv, st: st, ev: ev, mine: true,
+                who: '', score: raceScore(m) + (ev ? ev.delta : 0) };
+        });
+        runners.sort(function (a, b) { return b.score - a.score; });
+        runners.forEach(function (r, i) { r.rank = i + 1; });
+        /* 赛况（复用分段动画，措辞改成选拔赛） */
+        var anim = [];
+        anim.push('━━ 马厩选拔赛 · 起跑 ━━\n\n'
+            + '　' + use.length + ' 匹马在都城赛场集合\n'
+            + '　观众买票入场（门票 ' + SELECT_TICKET + ' 金/匹）\n'
+            + '　今日赛事由你自己主持');
+        anim.push('　　━━发 令 ━━\n\n　砰！发令枪响——\n　' + use.length + ' 匹马冲出闸门！\n\n　起跑领先：' + runners[0].nm);
+        var mid = runners.slice().sort(function (a, b) { return b.score * (0.85 + Math.random() * 0.3) - a.score * (0.85 + Math.random() * 0.3); });
+        anim.push('　　— 中段 —\n\n'
+            + (runners.some(function (r) { return r.ev; })
+                ? '　⚡ 场上出现状况！' + (runners.filter(function (r) { return r.ev; })[0] || {}).nm
+                    + (runners.filter(function (r) { return r.ev; })[0] || {}).ev.txt + '\n'
+                : '　中段节奏稳健\n')
+            + '\n　　中段领先：' + mid[0].nm);
+        var late = runners.slice().sort(function (a, b) { return (b.score + (Math.random() - 0.5) * 20) - (a.score + (Math.random() - 0.5) * 20); });
+        anim.push('　　— 最后冲刺 —\n\n'
+            + (late[0].nm !== mid[0].nm ? '　🔥 ' + late[0].nm + ' 突然发力反超 ' + mid[0].nm + '！' : '　格局未变，领先者守住\n')
+            + '\n　　冲刺阶段：' + late[0].nm + '暂列第一');
+        anim.push('　　━━ 冲 线 ━━\n\n'
+            + '　🏆 冠军：' + runners[0].nm + '　（移动+' + runners[0].mv + ' 状态' + runners[0].st.s + '）\n'
+            + '　门票收入 +' + got + ' 金（' + use.length + ' 匹 × ' + SELECT_TICKET + '）\n\n'
+            + '　（点确认查看全部排名）');
+        /* 排名 + 奖金（选拔赛也发奖，但比大会低，只算门票为主） */
+        var lines = ['【选拔赛】马厩自办 · ' + use.length + ' 匹马 · 门票收入 +' + got + ' 金', ''];
+        runners.forEach(function (r) {
+            lines.push('  第' + r.rank + '名  ' + pad(r.nm, 8) + ' 移动+' + r.mv + '  状态' + r.st.s
+                + (r.ev ? '  ⚠' + r.ev.txt : ''));
+        });
+        /* 冠军奖励（低于大会，因为门票才是主收益） */
+        if (got > 0 || true) { /* 门票已入账 */ }
+        lines.push('');
+        lines.push('  冠军：' + runners[0].nm + '　门票 +' + got + ' 金');
+        /* 状态回落 */
+        runners.forEach(function (r) {
+            var st = mountState(myKing, r.nm);
+            st.s = Math.max(20, st.s - (2 + rand(4)));
+            if (st.sick && Math.random() < 0.5) st.sick = 0;
+        });
+        try { saveRaceState(); } catch (e) { }
+        return { anim: anim, lines: lines, ticket: got };
+    }
+
+    /* 选拔赛入口：可选参赛马（默认全部），门票 = 参赛马数 × 1000 金 */
+    function raceSelectDialog() {
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var pool = raceMountPool().filter(function (m) { return m.king === myKing; });
+        if (pool.length < 2) { alert2('至少要有 2 匹马才能办选拔赛。\n（当前 ' + pool.length + ' 匹，去收集赤兔/的卢 等战马）'); return; }
+        var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
+        var have = city ? (Number(city.Money) || 0) : 0;
+        var lines = ['【马厩选拔赛】你自己的马互跑 · 收门票 · 每月一次',
+            '门票 ' + SELECT_TICKET + ' 金/匹（观众付费，直接进你的都城金库）', ''];
+        pool.forEach(function (m, i) {
+            var st = mountState(myKing, m.nm);
+            lines.push('  [' + i + '] ' + pad(m.nm, 8) + ' 移动+' + m.mv + '　状态 ' + st.s
+                + (st.sick ? '（病）' : '') + '　门票 +' + SELECT_TICKET);
+        });
+        lines.push('');
+        lines.push('  【全部出赛】（' + pool.length + ' 匹，门票 +' + (pool.length * SELECT_TICKET) + ' 金）');
+        lines.push('  【一键全选后开赛】');
+        menu(lines, 0, function (ind) {
+            if (ind === baye.None || ind === 65535 || ind === undefined) return;
+            if (ind < pool.length) {
+                /* 单匹报名 = 只跑这匹（不足 2 匹会提示） */
+                if (pool.length < 2) { alert2('不足 2 匹'); return; }
+                var res = raceSelectRun([ind]);
+                if (res) playRaceAnim(res.anim, res.lines, function () { stableDialog(); });
+                return;
+            }
+            /* 全部出赛 */
+            if (have >= pool.length * SELECT_TICKET || true) {
+                var r2 = raceSelectRun(null);
+                if (r2) playRaceAnim(r2.anim, r2.lines, function () { stableDialog(); });
+            }
+        });
     }
 
     function stableDialog() {
@@ -4158,7 +4371,7 @@
         }
         if (RACE_HISTORY.length) {
             lines.push('  历届冠军：' + RACE_HISTORY.slice(0, 3).map(function (h) {
-                return h.name + '·' + safeName(h.king) + '(' + h.date + ')';
+                return h.name + '·' + kingName(h.king) + '(' + h.date + ')';
             }).join('、'));
         }
         lines.push('【坐骑图鉴】登记在册的 ' + Object.keys(seen).length + ' 种');
@@ -4171,23 +4384,25 @@
         });
         var lack = [];
         for (i = 0; i < MOUNT_NAMES.length; i++) if (!seen[MOUNT_NAMES[i]]) lack.push(MOUNT_NAMES[i]);
-        if (lack.length) lines.push('  未收集：' + lack.join('、'));
+        if (lack.length) {
+            /* 长名单一行塞不下会溢出成乱码（用户截图），改成每行 6 个分组显示 */
+            lines.push('  未收集（' + lack.length + ' 种）：');
+            for (i = 0; i < lack.length; i += 6) {
+                lines.push('    ' + lack.slice(i, i + 6).join('、'));
+            }
+        }
         /* 末尾追加操作项（菜单行号 = lines 的下标） */
         var actBase = lines.length;
         lines.push('');
-        if (rows.length) {
-            lines.push('① 报名下届赛马大会（选马+交粮草报名费）');
-            lines.push('② 喂马：花 100 粮草提升状态（上限 100，可治病）');
-        }
-        lines.push('③ 立即举办一届（看结果，不报名不发钱）');
-        lines.push('④ 粮草换钱：500 粮 → 800 金');
+        lines.push('① 报名赛马大会（各势力同场竞技，冠军 ' + RACE_PRIZE[0] + ' 金）');
+        lines.push('② 喂马：花 100 粮草提升状态（上限 100，可治病）');
+        lines.push('③ 马厩选拔赛：自己的马互跑，每匹收门票 ' + SELECT_TICKET + ' 金（每月一次）');
         menu(lines, 0, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) return;
             var k = ind - actBase;
-            if (k === 1) { raceSignUpDialog(); return; }               /* 报名 */
+            if (k === 1) { raceSignUpDialog(); return; }               /* 报名大会 */
             if (k === 2) { feedStableDialog(); return; }              /* 喂马提状态 */
-            if (k === 3) { raceRunNowDialog(); return; }              /* 立即举办 */
-            if (k === 4) { feedMounts(); return; }                    /* 粮换钱 */
+            if (k === 3) { raceSelectDialog(); return; }              /* 选拔赛 */
         });
     }
 

@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.20.1';
+    var CHEAT_VERSION = '1.20.2';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -4088,64 +4088,65 @@
         });
         runners.sort(function (a, b) { return b.score - a.score; });
         runners.forEach(function (r, i) { r.rank = i + 1; });
-        /* ③ 赛况动画：分 6 段推进，有领先易位、有超车、有事故，最后冲线。
-           每一段都是一条弹窗内容（引擎一次只显示一屏），点确认继续下一段 →
-           玩家能完整看完比赛过程，而不是"一闪而过的结果"。 */
-        var anim = [], seg, q, order, lead, prevLead;
-        order = runners.slice();
-        /* 按速度排（快马在前）作为起跑假设 */
-        order.sort(function (a, b) { return b.score - a.score; });
-        seg = '━━ 第' + (season + 1) + ' 届赛马大会· 起跑 ━━\n\n'
-            + '　赛前检录：' + order.length + ' 匹马入场\n'
-            + '　看台观众爆满，都城旌旗飘扬\n'
-            + '　各势力马夫牵马就位，骑手压低身形\n\n'
-            + '　（按「下一项」继续）';
+        /* ③ 赛况动画：6 段推进（起跑/发令/中段/冲刺/最后100米/冲线）。
+           ★每屏 ≤5 行：引擎窗口行高有限，行数多了底部会被裁掉。
+           ★不用空行（\n\n）：引擎会把空行渲染成大片空白，看起来像叠字。
+           ★不用「（按下一项继续）」这类长提示：playRaceAnim 会单独加进度行。 */
+        var anim = [], seg, q, order, mid, late, accident;
+        order = runners.slice().sort(function (a, b) { return b.score - a.score; });
+
+        seg = '━━ 第' + (season + 1) + ' 届赛马大会 ━━\n'
+            + '都城赛场 · ' + order.length + ' 匹马入场\n'
+            + '看台爆满，旌旗飘扬\n'
+            + '马夫就位，骑手压低身形';
         anim.push(seg);
-        /* 第2 段：发令 */
-        seg = '　　━━发 令 ━━\n\n'
-            + '　砰！发令枪响——\n'
-            + '　' + order.length + ' 匹马如离弦之箭冲出闸门！\n\n'
-            + '　起跑阶段（快马抢位）\n'
-            + '　领先：' + order[0].nm + '（' + kingName(order[0].king) + '）\n'
-            + '　紧随：' + (order[1] ? order[1].nm : '—') + '、' + (order[2] ? order[2].nm : '—');
+
+        seg = '━━ 发 令 ━━\n'
+            + '砰！发令枪响——\n'
+            + order.length + ' 匹马冲出闸门！\n'
+            + '起跑领先：' + order[0].nm + '（' + kingName(order[0].king) + '）\n'
+            + '紧随：' + (order[1] ? order[1].nm : '—')
+            + (order[2] ? '、' + order[2].nm : '');
         anim.push(seg);
-        /* 第3 段：中途加速 + 可能的事故 */
-        var mid = order.slice().sort(function (a, b) { return b.score * (0.85 + Math.random() * 0.3) - a.score * (0.85 + Math.random() * 0.3); });
-        seg = '　　— 中段 —\n\n';
-        /* 随机一匹在事故里（如果有） */
-        var accident = null;
+
+        mid = order.slice().sort(function (a, b) {
+            return b.score * (0.85 + Math.random() * 0.3) - a.score * (0.85 + Math.random() * 0.3);
+        });
+        accident = null;
         for (q = 0; q < mid.length; q++) if (mid[q].ev) { accident = mid[q]; break; }
+        seg = '━━ 中 段 ━━\n';
         if (accident) {
-            seg += '　⚡ ' + accident.nm + ' 出状况！' + accident.ev.txt + '\n';
-            seg += '　　　（' + kingName(accident.king) + '的马夫在场边急得直跳）\n';
+            seg += '⚡ 意外！' + accident.nm + '：' + accident.ev.txt + '\n'
+                + '　马夫在场边急得直跳';
         } else {
-            seg += '　中段节奏稳健，暂无意外\n';
+            seg += '节奏稳健，暂无意外';
         }
-        seg += '\n　　中段领先：' + mid[0].nm + '（' + kingName(mid[0].king) + '）';
-        if (mid[0].ev) seg += '　⚠ 带着伤在跑！';
+        seg += '\n中段领先：' + mid[0].nm;
         anim.push(seg);
-        /* 第 4 段：易位 / 超车 */
-        var late = runners.slice().sort(function (a, b) { return (b.score + (Math.random() - 0.5) * 20) - (a.score + (Math.random() - 0.5) * 20); });
-        seg = '　　— 最后冲刺 —\n\n';
-        if (mid[0] && late[0] && late[0].nm !== mid[0].nm) {
-            seg += '　🔥 ' + late[0].nm + ' 突然加速！强行超车——\n';
-            seg += '　　反超 ' + late[0].nm + ' → ' + mid[0].nm + '\n';
+
+        late = runners.slice().sort(function (a, b) {
+            return (b.score + (Math.random() - 0.5) * 20) - (a.score + (Math.random() - 0.5) * 20);
+        });
+        seg = '━━ 最后冲刺 ━━\n';
+        if (late[0].nm !== mid[0].nm) {
+            seg += '🔥 ' + late[0].nm + ' 突然发力，强行超车！\n'
+                + '　反超 ' + mid[0].nm + ' → ' + late[0].nm;
         } else {
-            seg += '　格局未变，领先者死死守住\n';
+            seg += '格局未变，领先者死死守住';
         }
-        seg += '\n　　冲刺阶段：' + late[0].nm + '暂列第一';
+        seg += '\n冲刺：' + late[0].nm + '暂列第一';
         anim.push(seg);
-        /* 第 5 段：最后 100 米 */
-        seg = '　　— 最后 100 米 —\n\n'
-            + '　看台沸腾！\n'
-            + '　' + late[0].nm + ' 咬牙冲刺，'+ (late[1] ? late[1].nm + ' 在身后紧咬！' : '后方紧追！') + '\n';
+
+        seg = '━━ 最后 100 米 ━━\n'
+            + '看台沸腾！\n'
+            + late[0].nm + ' 咬牙冲刺\n'
+            + (late[1] ? late[1].nm + ' 在身后紧咬！' : '后方紧追！');
         anim.push(seg);
-        /* 第 6 段：冲线 + 结果概要（详细排名在下一段） */
-        seg = '　　━━ 冲 线 ━━\n\n'
-            + '　🏆 冠军：' + runners[0].nm + '！（' + kingName(runners[0].king) + '）\n'
-            + '　亚军：' + (runners[1] ? runners[1].nm : '—') + '\n'
-            + '　季军：' + (runners[2] ? runners[2].nm : '—') + '\n\n'
-            + '　（点确认查看全部排名）';
+
+        seg = '━━ 冲 线 ━━\n'
+            + '🏆 冠军：' + runners[0].nm + '（' + kingName(runners[0].king) + '）\n'
+            + '　亚军：' + (runners[1] ? runners[1].nm : '—')
+            + '\n　季军：' + (runners[2] ? runners[2].nm : '—');
         anim.push(seg);
         /* 结果：列全排名 + 标注异常 */
         var lines = ['【赛马】第' + (season + 1) + '届 · ' + runners.length + ' 匹马', ''];
@@ -4220,18 +4221,29 @@
     }
     /* ③ 串行播赛况：一次只显示一屏，点确认继续下一段 → 完整看完比赛过程 */
     function playRaceAnim(anim, lines, onDone) {
+        /* ★ 用 menu（大窗口）而不是 alert（小弹窗）：
+             alert 的框只有屏幕上方一小块、背景半透明（地图文字会透出来）、
+             行宽约 14 个汉字，超出就换行错位（用户截图：文字叠成一片）。
+           menu 走 centerChoose(SW-8, SH-8)，有完整边框、自动折行、行高自适应。 */
         var segs = anim.slice();
-        segs.push('');                       /* 空行分隔 */
-        segs = segs.concat(lines);           /* 最后接完整排名 */
+        if (lines && lines.length) {
+            segs.push('━━━━━━━━━━━ 全部排名 ━━━━━━━━━━━');
+            segs = segs.concat(lines);
+        }
         var i = 0;
         function next() {
             if (i >= segs.length) { if (onDone) { try { onDone(); } catch (e) { } } return; }
-            var txt = segs[i++];
-            if (!txt) { next(); return; }
-            var more = i < segs.length ? '\n\n（下按继续 · ' + i + '/' + segs.length + '）' : '\n\n（本条结束）';
-            try {
-                baye.alert(gbkSafe(txt + more), function () { next(); });
-            } catch (e) { if (onDone) { try { onDone(); } catch (e2) { } } }
+            var seg = segs[i++];
+            if (!seg) { next(); return; }
+            /* 只保留正文；进度提示单独一行（避免和正文混在一起） */
+            var body = seg.replace(/\n\n（下按继续[^\n]*）$/, '');
+            var items = body.split('\n');
+            items.push('');
+            items.push('─ 继续（' + i + '/' + segs.length + '）─');
+            menu(items, items.length - 1, function (ind) {
+                if (ind === baye.None || ind === 65535 || ind === undefined) { i = segs.length; }
+                next();
+            });
         }
         next();
     }

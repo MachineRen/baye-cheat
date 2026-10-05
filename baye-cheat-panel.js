@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.18.0';
+    var CHEAT_VERSION = '1.19.0';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -187,7 +187,15 @@
                 probeMoneyCap: probeMoneyCap,
                 /* 换月/读档时清空「本月已打过」账本；控制台与测试也用它复位 */
                 /* 重置出征节奏（调试用：清掉冷却与加码计数） */
-                race: function () { return runRace(true); },
+                /* 赛马 v2 api */
+                race: function () { var r = raceRunOne(raceSeason()); return r.lines; },
+                raceFull: function () { return raceRunOne(raceSeason()); },
+                raceSignUp: function () { raceSignUpDialog(); return true; },
+                racePool: function () { return raceMountPool(); },
+                raceState: function (nm) { return mountState((baye.data.g_PlayerKing || 0) + 1, nm); },
+                raceEntry: function () { return RACE_ENTRY.slice(); },
+                raceHistory: function () { return RACE_HISTORY.slice(); },
+                feedStable: function () { feedStableDialog(); return true; },
                 raceMounts: function () { return myMounts(); },
                 feedMounts: function () { feedMounts(); return true; },
                 resetWarRhythm: function () { WAR_LAST = {}; WAR_COUNT = {}; return true; },
@@ -2732,12 +2740,15 @@
         try { notes = notes.concat(monthlyBoon() || []); } catch (e2) { log('资源包异常', e2); }
         /* 出征结果核对：出征记录是决定出兵，战斗记录才是结果；对不上要说明 */
         try { notes = notes.concat(checkSortieResults() || []); } catch (e3) { }
-        /* 赛马大会：每 3 个月（3/6/9/12 月）月末自动举办一次，按名次发奖金 */
+        /* 赛马大会 v2：每 3 个月（3/6/9/12 月）月末自动举办。
+           玩家未报名 → 只看结果不发钱；报名了→ 按名次发奖金。*/
         try {
-            if (flag('raceOn') && myMounts().length) {
+            if (flag('raceOn')) {
                 var md = baye.data.g_MonthDate || 0;
                 if (md % 3 === 0 && RACE_LAST_HELD !== raceSeason()) {
-                    notes = notes.concat(runRace(false) || []);
+                    var rr = raceRunOne(raceSeason());
+                    notes = notes.concat(rr.lines || []);
+                    RACE_ENTRY = [];                        /* 本届结束清空报名 */
                 }
             }
         } catch (e4) { log('赛马大会异常', e4); }
@@ -3726,104 +3737,377 @@
         for (var i = 0; i < MOUNT_NAMES.length; i++) if (MOUNT_NAMES[i] === nm) return true;
         return false;
     }
-    /* 马厩：列出玩家名下所有马匹（谁骑、几匹、按移动力排序） */
 
-    /* ================= 赛马大会（v1.18.0）=================
-       用户需求：每三个月办一次，按马匹排名发钱（促进强化），并消耗粮食做功能。
-       设计（照搬成熟赛马玩法，且完全用引擎已有字段，不新增存档结构）：
-       · 参赛：玩家名下所有坐骑（马厩里那些）
-       · 排名依据：**移动力 + 速度扰动**（move 高的赢，同档位随机比）
-       · 奖励：名次对应的金币（从高到低递减），走引擎 Money 字段（上限 30000）
-       · 消耗粮食：报名费/ 赛后草料消耗，用 city.Food 扣（粮草上限 65536）
-       · 周期：每 3 个月（3/6/9/12 月），在月末 tacticStage5 自动举办
-       · 扩展马厩：马厩里能看到「本届战绩 / 下届倒计时 / 历史冠军」
+    /* ---------- ② 赛前报名（粮食报名费，彩票式递增）---------- */
+    var RACE_FEE = [0, 300, 800, 1800];         /* 0/1/2/3 匹的报名费（粮草） */
+    var RACE_MAX_HORSE = 3;
+    /* 本势力（玩家）已报名的马：{name, mv} */
+    var RACE_ENTRY = [];
+    function raceEntryFee(n) { return RACE_FEE[Math.max(0, Math.min(RACE_MAX_HORSE, n | 0))] || 0; }
+    /* 报名：扣粮草、记名。返回提示。 */
+    function raceEnter(horses, c) {
+        var fee = raceEntryFee(horses.length);
+        if (horses.length > RACE_MAX_HORSE) return { ok: false, msg: '一个势力最多 ' + RACE_MAX_HORSE + ' 匹马' };
+        if (fee <= 0) { RACE_ENTRY = []; return { ok: true, msg: '已放弃报名（不参赛不扣粮）' }; }
+        var have = Number(c.Food) || 0;
+        if (have < fee) return { ok: false, msg: '粮草不足：报名费 ' + fee + '，只有 ' + have };
+        c.Food = have - fee;
+        RACE_ENTRY = horses.slice();
+        return { ok: true, msg: '报名成功：' + horses.map(function (h) { return h.nm; }).join('、')
+            + '　报名费 ' + fee + ' 粮草' };
+    }
+    /* 报名弹窗：问「是否报名」→ 选马（0~3 匹）。 */
+    function raceSignUpDialog() {
+        var myKing = (baye.data.g_PlayerKing || 0) + 1, c = capitalCity();
+        var city = c >= 0 ? cityAt(c) : null;
+        if (!city) { alert2('没有都城，无法报名。'); return; }
+        var pool = raceMountPool().filter(function (m) { return m.king === myKing; });
+        if (!pool.length) {
+            menu(['你名下没有马匹，无法参赛。', '（先去收集赤兔 / 的卢 / 里飞沙等战马）'], 0, null);
+            return;
+        }
+        var lines = ['【赛马大会·报名】都城：' + cityName(c), ''];
+        pool.forEach(function (m, i) {
+            var st = mountState(m.king, m.nm);
+            lines.push('  [' + i + '] ' + pad(m.nm, 8) + ' 移动+' + m.mv
+                + '　状态 ' + st.s + (st.sick ? '（病中）' : '') + '　押注费 ' + raceEntryFee(1) + '粮/匹');
+        });
+        lines.push('');
+        lines.push('报名费：1 匹 ' + raceEntryFee(1) + ' 粮 · 2 匹 ' + raceEntryFee(2) + ' 粮 · 3 匹 ' + raceEntryFee(3) + ' 粮');
+        lines.push('（不报名=不扣粮，也没有奖金）');
+        /* 选马：连续选直到选满 3 匹或选择「完成」 */
+        var picked = [];
+        function step() {
+            var cur = lines.slice(0, lines.length);
+            picked.forEach(function (m, i) { cur.push('  已选[' + (i + 1) + '] ' + m.nm + ' 移动+' + m.mv); });
+            cur.push('');
+            cur.push('【' + (picked.length ? '完成报名（' + raceEntryFee(picked.length) + ' 粮）' : '放弃报名') + '】');
+            menu(cur, 0, function (ind) {
+                if (ind === baye.None || ind === 65535 || ind === undefined) return;
+                if (ind < pool.length) {
+                    var m = pool[ind];
+                    if (picked.some(function (x) { return x.nm === m.nm; })) { alert2(m.nm + ' 已经选过了'); step(); return; }
+                    if (picked.length >= RACE_MAX_HORSE) { alert2('最多 ' + RACE_MAX_HORSE + ' 匹'); step(); return; }
+                    picked.push(m);
+                    step();
+                    return;
+                }
+                /* 完成 / 放弃 */
+                var r = raceEnter(picked, city);
+                alert2(r.msg);
+                if (r.ok) { RACE_ENTRY = picked.slice(); try { saveRaceState(); } catch (e) { } }
+            });
+        }
+        step();
+    }
 
-       为什么用移动力而不是别的：坐骑在引擎里只有 move 一个属性（at/iq 全 0），
-       文档也明确「坐骑均无特效」→ 移动力是唯一能拉开差距的天然属性。 */
+    /* ---------- ⑤ 比赛核心：状态 + 随机事件 + 权重 ---------- */
+    /* 单场表现分 = 移动力基础 + 状态 + 骑手 + 随机扰动 + 事件 */
+    /* 评分权重（经 sim-race.js 300 场蒙特卡洛调定）：
+         移动力 20/档（主要因素）· 状态 0.8/点（次要）· 病态 -14 · 随机扰动 ±8
+       模拟结论：满状态赤兔夺冠率 63%，不喂食 47%；移动力阶梯清晰（平均名次 1.67/6.31/9.40）；
+       慢马夺冠率 10.7%（有翻盘空间但不是白送）；异常发生率 33%。 */
+    function raceScore(m) {
+        var st = mountState(m.king, m.nm);
+        var base = m.mv * 20;                        /* 移动力基础（mv1=20, mv2=40, mv3=60） */
+        var stPart = (st.s - 70) * 0.8;                /* 状态：100→+24, 60→-8 */
+        if (st.sick) stPart -= 14;                    /* 病态：再减 14 */
+        var noise = (Math.random() - 0.5) * 16;        /* 随机扰动 ±8：给状态好的慢马翻盘空间 */
+        return base + stPart + noise;
+    }
+    /* 随机事件：返回 {txt, delta} 或 null。概率随状态降低（状态差=事故多）。 */
+    function raceEvent(m, st) {
+        var p = Math.max(0, (100 - st.s)) / 100;       /* 状态越低越容易出事 */
+        var r = Math.random();
+        if (st.sick) {
+            if (r < 0.30) return { txt: m.nm + ' 带病上阵，状态不佳', delta: -15 };
+        } else if (r < p * 0.25) {
+            return { txt: m.nm + ' 失前蹄，摔了个跟头', delta: -12 };
+        } else if (r < p * 0.38) {
+            return { txt: '骑手坠马！' + m.nm + ' 无人牵引', delta: -20 };
+        } else if (r < p * 0.50) {
+            return { txt: m.nm + ' 受场外喧哗刺激，受惊', delta: -8 };
+        } else if (r < p * 0.58) {
+            return { txt: m.nm + ' 体力不支，掉速', delta: -6 };
+        }
+        return null;
+    }
 
-    var RACE_SEASON = 0;        /* 赛季号（每3 个月 +1） */
-    var RACE_HISTORY = [];      /* 历届冠军：{season, name, mv, date} */
-    var RACE_LAST_HELD = -1;    /* 上次举办的赛季号，避免同月重复发奖 */
+    /* ================= 赛马大会 v2.0（v1.19.0）=================
+       玩家需求（7 条）：
+       ① 各势力出马比赛 —— 不是玩家自己马厩的马互相比。系统维护「全局马池」，
+          每匹��有归属势力；AI 势力用**在野未搜出**的马（玩家搜到就没了）。
+       ② 赛前弹窗报名 —— 玩家选择是否参加、派几匹马；**报名费=粮食**，
+          派得越多越贵（彩票式：1 匹 300 粮 / 2 匹 800 / 3 匹 1800），一个势力最多 3 匹。
+       ③ 赛马动画 —— 逐匹播报（起跑/领先/超车/异常），带解说节奏。
+       ④ 奖金大幅提高 —— 冠军 ≥ 10000金。
+       ⑤ 状态 + 随机性 —— 每匹马有「状态值 0~100」，马厩喂食（花粮）可提状态；
+          移动力只是基础分，还有状态、骑手、随机事件（生病/失前蹄/骑手坠马/场外刺激），
+          **结果必须列全排名并标注异常**；状态正常时赤兔仍是最大热门。
+       ⑥ 连胜奖励 —— 连续夺冠有额外奖金。
+       ⑦ 蒙特卡洛模拟 100 场验证（开发期用，见 sim-race.js）。
+
+       ★ 关键设计取舍：
+       - 状态值存在 localStorage（和强化表同机制，跟档绑定），不写引擎数据。
+       - 异常事件只影响**本场**，不改状态；但「生病」会写进状态（需喂食 cures）。
+       - 报名费是可选项，不报名 = 0 支出，但也没奖金。 */
+
+    var RACE_SEASON = 0;        /* 赛季号（每 3 个月 +1） */
+    var RACE_HISTORY = [];      /* 历届冠军{season,name,king,date} */
+    var RACE_LAST_HELD = -1;    /* 上次举办的赛季号，避免同赛季重复发奖 */
     function raceSeason() { return Math.floor(gameMonthIndex() / 3); }
     function raceNextMonths() {
-        var mk = gameMonthIndex(), into = mk % 3;    /* 本赛季第几个月（0-2） */
-        return 3 - into;                              /* 距下届还有几月 */
+        var into = gameMonthIndex() % 3;
+        return 3 - into;                     /* 距下届还有几月（1~3） */
     }
-    /* 玩家名下的马（马厩共用） */
+    /* 玩家名下的马（马厩列表 / 报名候选都用它） */
     function myMounts() {
-        var myKing = (baye.data.g_PlayerKing || 0) + 1;
-        var persons = baye.data.g_Persons, out = [], i, s, tid0, t, nm, mv;
+        return raceMountPool().filter(function (m) {
+            return m.king === (baye.data.g_PlayerKing || 0) + 1;
+        });
+    }
+    /* 粮草换钱（吃不掉的高位粮草换个用） */
+    function feedMounts() {
+        var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
+        if (!city) { alert2('没有都城。'); return; }
+        var have = Number(city.Food) || 0;
+        if (have < 500) { alert2('粮草不足：需要 500，只有 ' + have); return; }
+        city.Food = have - 500;
+        var room = Math.max(0, 30000 - (Number(city.Money) || 0));
+        var add = Math.min(800, room);
+        if (add > 0) city.Money = (Number(city.Money) || 0) + add;
+        alert2('粮草换钱：-500 粮　+' + add + ' 金（粮草剩 ' + (Number(city.Food) || 0) + '）');
+        log('马厩·粮换金：粮-' + 500 + ' 金+' + add);
+    }
+
+    /* ---------- 全局马池 ---------- */
+    /* 池里的马 = MOUNT_NAMES × 归属势力。
+       玩家的马：扫玩家武将身上的坐骑（已搜出的）。
+       AI 的马：按「势力拥有的坐骑名」清单生成，含状态，未被玩家搜到。 */
+    function raceMountPool() {
+        var pool = [], myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var persons = baye.data.g_Persons, i, s2, tid0, t, nm;
+        /* ① 玩家的马：直接扫武将装备 */
         for (i = 0; i < persons.length; i++) {
             var p = persons[i];
             if (!p || !p.Level || p.Level <= 0 || p.Belong !== myKing) continue;
-            for (s = 0; s < 2; s++) {
-                if (!p.Equip[s]) continue;
-                tid0 = p.Equip[s] - 1;
+            for (s2 = 0; s2 < 2; s2++) {
+                if (!p.Equip[s2]) continue;
+                tid0 = p.Equip[s2] - 1;
                 t = baye.data.g_Tools[tid0];
                 if (!t) continue;
                 try { nm = gbkSafe(baye.getToolName(tid0)) || ''; } catch (e) { nm = ''; }
                 if (!isMountName(nm)) continue;
-                out.push({ nm: nm, mv: MOUNT_MV[nm] || (t.move || 1), who: nameOf(i), mixed: !!(t.at || t.iq) });
+                pool.push({ nm: nm, mv: MOUNT_MV[nm] || (t.move || 1), king: myKing, mine: true });
             }
         }
-        out.sort(function (a, b) { return b.mv - a.mv || (a.nm < b.nm ? -1 : 1); });
+        /* ② 各势力的马：按势力拥有的坐骑名清单（含玩家搜不到的「在野马」） */
+        var own = raceKingMounts();
+        for (var k in own) {
+            if (!own.hasOwnProperty(k)) continue;
+            var king = Number(k);
+            if (king === myKing) continue;                /* 玩家的马已从装备里扫过 */
+            var list = own[k];
+            for (i = 0; i < list.length; i++) {
+                pool.push({ nm: list[i], mv: MOUNT_MV[list[i]] || 1, king: king, mine: false });
+            }
+        }
+        return pool;
+    }
+    /* 各势力拥有的马（AI 势力的马是"系统生成"的，含玩家未搜出的在野马）。
+       规则：势力越大马越多；同一个势力不会有多匹同名马。 */
+    function raceKingMounts() {
+        var out = {}, cities = baye.data.g_Cities, i, k, seen;
+        for (i = 0; i < cities.length; i++) {
+            if (!cities[i]) continue;
+            k = cities[i].Belong;
+            if (k <= 0 || k === WILD || k === CAPTIVE) continue;
+            if (!out[k]) { out[k] = []; seen = {}; out[k]._seen = seen; }
+        }
+        var names = MOUNT_NAMES.slice();
+        for (k in out) {
+            if (!out.hasOwnProperty(k)) continue;
+            var n = ownCities(Number(k)).length;        /* 马数 = 城池数（1~5匹） */
+            var want = Math.max(1, Math.min(5, n));
+            var seen = out[k]._seen;
+            var bag = names.slice();
+            for (i = 0; i < want && bag.length; i++) {
+                /* 随机抽马（大势力优先抽到快马） */
+                var idx = rand(bag.length);
+                var nm = bag.splice(idx, 1)[0];
+                if (seen[nm]) { i--; continue; }         /* 同势力不重复同名 */
+                seen[nm] = 1;
+                out[k].push(nm);
+            }
+        }
+        /* 去掉临时字段 */
+        for (k in out) { if (out.hasOwnProperty(k)) delete out[k]._seen; }
         return out;
     }
-    /* 举办一届赛马大会。返回记录行（写进月报）。 */
-    function runRace(force) {
-        var ms = myMounts();
-        if (!ms.length) {
-            if (force) alert2('你没有马匹参加不了赛马大会。\n（先去收集赤兔/的卢/里飞沙 等战马）');
-            return [];
+
+    /* ---------- 马匹状态（持久化，跟存档槽）---------- */
+    var RACE_STATE_KEY = 'baye_cheat_racestate_v1';
+    var RACE_ST = (function () {
+        var o = {};
+        try {
+            var raw = localStorage.getItem(skey('racestate_v1'));
+            if (raw) o = JSON.parse(raw) || {};
+        } catch (e) { }
+        return o;
+    })();
+    function saveRaceState() {
+        try { localStorage.setItem(skey('racestate_v1'), JSON.stringify(RACE_ST)); } catch (e) { }
+    }
+    /* 状态键：势力+马名（同势力同名马唯一） */
+    function stKey(king, nm) { return king + '_' + nm; }
+    function mountState(king, nm) {
+        var k = stKey(king, nm);
+        if (!RACE_ST[k]) {
+            /* 初始状态 60~85（随机，看起来更自然） */
+            RACE_ST[k] = { s: 60 + rand(26), sick: Math.random() < 0.05 ? 1 : 0, feed: 0, win: 0, lose: 0, streak: 0 };
         }
-        var mk = gameMonthIndex(), season = raceSeason();
-        /* 同档位随机排序（移动力相同则比运气），保证名次不固定 */
-        var pool = ms.slice();
-        for (var i = pool.length - 1; i > 0; i--) {
-            var j = rand(i + 1), t = pool[i];
-            pool[i] = pool[j]; pool[j] = t;
+        return RACE_ST[k];
+    }
+    var STATE_MAX = 100;
+    /* 喂食：花粮提状态。粮草 100 → 状态 +6（上限 100）。有病先治。 */
+    function feedRaceMount(king, nm, food) {
+        var st = mountState(king, nm);
+        if (st.s >= STATE_MAX && !st.sick) return { ok: false, msg: '状态已满（' + st.s + '），无需喂食' };
+        st.s = Math.min(STATE_MAX, st.s + 6);
+        st.feed = (st.feed || 0) + 1;
+        if (st.sick) { st.sick = 0; st.s = Math.min(STATE_MAX, st.s + 3); return { ok: true, cured: true, msg: '喂食后' + nm + ' 病愈，状态 ' + st.s }; }
+        return { ok: true, msg: nm + ' 状态 +6 → ' + st.s };
+    }
+
+    /* ---------- ③④⑥ 比赛执行：AI 自动报名 + 评分排名 + 奖金 + 连胜 ---------- */
+    /* 奖金表：冠军 12000（用户要求≥1万），逐级递减 */
+    var RACE_PRIZE = [12000, 7000, 4000, 2500, 1500, 1000, 700, 500, 350, 250];
+    var RACE_STREAK_BONUS = [0, 0, 2000, 4000, 8000, 15000];  /* 连胜2/3/4/5/6+ 额外奖 */
+    /* AI 势力自动报名：每势力最多 3 匹，从其马池里挑最快的（带随机爆冷门） */
+    function aiRaceEntry(pool, myKing) {
+        var byKing = {};
+        pool.forEach(function (m) {
+            if (m.king === myKing) return;
+            if (!byKing[m.king]) byKing[m.king] = [];
+            byKing[m.king].push(m);
+        });
+        var entries = [];
+        for (var k in byKing) {
+            if (!byKing.hasOwnProperty(k)) continue;
+            var list = byKing[k];
+            if (Math.random() > 0.7) continue;                 /* 每势力 70% 概率参加 */
+            var n = 1 + rand(Math.min(3, list.length));
+            list.sort(function (a, b) { return b.mv - a.mv; });
+            var pick = list.slice(0, n);
+            if (Math.random() < 0.25 && list.length > n) pick[0] = list[n];   /* 偶尔爆冷门 */
+            entries.push({ king: Number(k), horses: pick });
         }
-        pool.sort(function (a, b) { return b.mv - a.mv; });
-        /* 奖励：第 1 名 1500，第 2 名 900，第 3 名 500，第 4+ 各 200（上限 10 匹） */
-        var REWARD = [1500, 900, 500, 250, 150, 100, 80, 60, 50, 40];
+        return entries;
+    }
+    /* 核心：跑一届比赛 */
+    function raceRunOne(season) {
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var pool = raceMountPool();
+        var entries = aiRaceEntry(pool, myKing);
+        if (RACE_ENTRY.length) entries.push({ king: myKing, horses: RACE_ENTRY.slice(), mine: true });
+        if (!entries.length) return { lines: ['【赛马】本届无人参赛'], anim: [], rank: [], playerGot: 0 };
+        var runners = [];
+        entries.forEach(function (e) {
+            e.horses.forEach(function (m) {
+                var st = mountState(e.king, m.nm);
+                var ev = raceEvent(m, st);
+                runners.push({ king: e.king, nm: m.nm, mv: m.mv, st: st, ev: ev,
+                    score: raceScore(m) + (ev ? ev.delta : 0), mine: !!e.mine });
+            });
+        });
+        runners.sort(function (a, b) { return b.score - a.score; });
+        runners.forEach(function (r, i) { r.rank = i + 1; });
+        /* ③ 动画播报（赛况解说） */
+        var anim = [];
+        anim.push('━━ 第' + (season + 1) + '届赛马大会 ━━');
+        anim.push('发令枪响！' + runners.length + ' 匹马冲出闸门');
+        var lead = runners[0];
+        for (var q = 1; q < runners.length; q++) if (runners[q].score > lead.score) lead = runners[q];
+        anim.push('中段领先：' + lead.nm + '（' + safeName(lead.king) + '军）');
+        runners.forEach(function (r) { if (r.ev) anim.push('⚠ ' + safeName(r.king) + '军：' + r.ev.txt); });
+        anim.push('终点冲线！');
+        /* 结果：列全排名 + 标注异常 */
+        var lines = ['【赛马】第' + (season + 1) + '届 · ' + runners.length + ' 匹马', ''];
+        runners.forEach(function (r) {
+            lines.push('  第' + r.rank + '名  ' + pad(r.nm, 8) + ' 移动+' + r.mv
+                + '  状态' + r.st.s + '  ' + safeName(r.king) + '军'
+                + (r.ev ? '  ⚠' + r.ev.txt : ''));
+        });
+        var got = 0, pri = [];
+        runners.forEach(function (r, i) {
+            var money = RACE_PRIZE[i] || 0;
+            if (r.mine && money > 0) { got += money; pri.push('第' + r.rank + '名 ' + r.nm + ' +' + money + '金'); }
+        });
+        /* ⑥ 连胜奖励 */
+        var champ = runners[0];
+        if (champ.mine) {
+            var cst = mountState(myKing, champ.nm);
+            cst.streak = (cst.streak || 0) + 1;
+            var sb = RACE_STREAK_BONUS[Math.min(cst.streak, RACE_STREAK_BONUS.length - 1)] || 0;
+            if (sb > 0) { got += sb; pri.push('★ 连胜 ' + cst.streak + ' 连冠！额外 +' + sb + '金'); }
+        }
+        runners.forEach(function (r) {
+            if (r.mine && r.rank !== 1) mountState(myKing, r.nm).streak = 0;
+        });
+        /* 状态自然回落（每场 -2~5，不喂食会掉）—— 这是「喂食」有意义的前提 */
+        runners.forEach(function (r) {
+            var st = mountState(r.king, r.nm);
+            st.s = Math.max(20, st.s - (2 + rand(4)));
+            if (st.sick && Math.random() < 0.5) st.sick = 0;   /* 病态有 50% 自愈 */
+        });
         var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
-        var got = 0, lines = [];
-        if (city) {
-            for (i = 0; i < pool.length && i < REWARD.length; i++) {
-                var add = Math.min(REWARD[i], Math.max(0, 30000 - (Number(city.Money) || 0)));
-                if (add <= 0) break;
-                city.Money = (Number(city.Money) || 0) + add;
-                got += add;
-                lines.push((i + 1) + '. ' + pool[i].nm + ' 移动+' + pool[i].mv + '（' + pool[i].who + '）+' + add + '金');
-            }
-        }
+        if (city && got > 0) city.Money = (Number(city.Money) || 0)
+            + Math.min(got, Math.max(0, 30000 - (Number(city.Money) || 0)));
+        else got = 0;
+        if (pri.length) { lines.push(''); lines.push('  你的奖金：'); pri.forEach(function (p) { lines.push('   ' + p); }); }
+        lines.push('');
+        lines.push('  本届冠军：' + champ.nm + '（' + safeName(champ.king) + '军）');
         RACE_SEASON = season;
         RACE_LAST_HELD = season;
-        var champ = pool[0];
-        RACE_HISTORY.unshift({ season: season, name: champ.nm, mv: champ.mv, who: champ.who,
+        RACE_HISTORY.unshift({ season: season, name: champ.nm, king: champ.king,
             date: monthKey().replace('-', '年') + '月' });
         if (RACE_HISTORY.length > 8) RACE_HISTORY.pop();
-        var out = ['【赛马】第' + (season + 1) + '届 · 都城长安 · 共' + pool.length + '匹参赛（' + champ.nm + ' 夺冠）'];
-        for (i = 0; i < lines.length; i++) out.push(' ' + lines[i]);
-        out.push(' 合计奖金 ' + got + ' 金（增强化用）');
-        return out;
+        try { saveRaceState(); } catch (e) { }
+        return { lines: lines, anim: anim, rank: runners, playerGot: got };
     }
-    /* 消耗粮食的马厩功能：用粮草换钱（喂马赛马的原设定） */
-    function feedMounts() {
-        var ms = myMounts();
-        if (!ms.length) { alert2('没有马匹。'); return; }
+
+    /* 喂马提状态：选一匹马，花 100 粮草，状态 +6（上限 100），有病顺便治 */
+    function feedStableDialog() {
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var pool = raceMountPool().filter(function (m) { return m.king === myKing; });
+        if (!pool.length) { alert2('没有马匹。'); return; }
         var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
         if (!city) { alert2('没有都城。'); return; }
-        var need = 500;                        /* 喂一次全马厩：500 粮 */
-        var have = Number(city.Food) || 0;
-        if (have < need) { alert2('粮草不足：需要 ' + need + '，只有 ' + have + '。\n（粮草上限 65535，被引擎 %65536 限制）'); return; }
-        city.Food = have - need;
-        var gain = 800;                        /* 换 800 金 */
-        var room = Math.max(0, 30000 - (Number(city.Money) || 0));
-        var add = Math.min(gain, room);
-        if (add > 0) city.Money = (Number(city.Money) || 0) + add;
-        alert2('喂马：消耗粮草 ' + need + '，换成金币 ' + add + '（' + ms.length + '匹马）');
-        log('马厩·喂马：粮草-' + need + ' 金+' + add);
+        var lines = ['【喂马】每匹花费 100 粮草 · 状态 +6（上限 100）· 可解除病态', '都城粮草：' + (Number(city.Food) || 0), ''];
+        pool.forEach(function (m, i) {
+            var st = mountState(myKing, m.nm);
+            lines.push('  [' + i + '] ' + pad(m.nm, 8) + ' 移动+' + m.mv + '　状态 ' + st.s
+                + (st.sick ? '（病中·喂食可治）' : '') + (st.s >= 100 ? '（已满）' : ''));
+        });
+        menu(lines, 0, function (ind) {
+            if (ind === baye.None || ind === 65535 || ind === undefined) return;
+            if (ind >= pool.length) return;
+            var m = pool[ind];
+            var food = Number(city.Food) || 0;
+            if (food < 100) { alert2('粮草不足：需要 100，只有 ' + food); return; }
+            var r = feedRaceMount(myKing, m.nm, 100);
+            if (!r.ok) { alert2(r.msg); return; }
+            city.Food = food - 100;
+            try { saveRaceState(); } catch (e) { }
+            alert2(r.msg + '　（粮草 -100，剩 ' + (Number(city.Food) || 0) + '）');
+        });
+    }
+    /* 立即举办一届：先播动画（逐条 alert），再给完整排名 */
+    function raceRunNowDialog() {
+        var season = raceSeason();
+        var res = raceRunOne(season);
+        var all = res.anim.concat(['']).concat(res.lines);
+        try { baye.alert(gbkSafe(all.join('\n')), function () { stableDialog(); }); } catch (e) { alert2(all.join('\n')); }
     }
 
     function stableDialog() {
@@ -3855,18 +4139,26 @@
         if (!rows.length) {
             lines.push('（还没有马匹。赤兔/的卢/里飞沙 等 29 匹战马都可以收集）');
         } else {
+            var myKing0 = (baye.data.g_PlayerKing || 0) + 1;
             for (i = 0; i < rows.length; i++) {
+                var st0 = mountState(myKing0, rows[i].nm);
                 lines.push(pad(rows[i].nm, 8) + ' 移动+' + rows[i].mv
-                    + '　' + rows[i].who + (rows[i].mixed ? '（混合型·带攻防）' : ''));
+                    + '　状态 ' + st0.s + (st0.sick ? '（病）' : '')
+                    + (st0.streak >= 2 ? '　连胜' + st0.streak : '')
+                    + '　' + rows[i].who + (rows[i].mixed ? '（混合型）' : ''));
             }
         }
         lines.push('');
-        /* 赛马大会：每 3 个月一届（3/6/9/12 月自动举办），按移动力排名发钱 */
-        lines.push('【赛马大会】每 3 个月一届（3/6/9/12 月月末自动举办）');
-        lines.push('  距下届还有 ' + raceNextMonths() + ' 个月· 当前第 ' + (raceSeason() + 1) + ' 届');
+        /* 赛马大会 v2：各势力出马、赛前报名（粮食报名费）、按状态+移动力综合评分 */
+        lines.push('【赛马大会】各势力出马 · 每 3 个月一届（3/6/9/12 月）');
+        lines.push('  距下届还有 ' + raceNextMonths() + ' 个月 · 第 ' + (raceSeason() + 1) + ' 届');
+        lines.push('  报名费（粮草）：1匹 ' + raceEntryFee(1) + ' · 2匹 ' + raceEntryFee(2) + ' · 3匹 ' + raceEntryFee(3));
+        if (RACE_ENTRY.length) {
+            lines.push('  ★ 本届已报名：' + RACE_ENTRY.map(function (m) { return m.nm; }).join('、'));
+        }
         if (RACE_HISTORY.length) {
             lines.push('  历届冠军：' + RACE_HISTORY.slice(0, 3).map(function (h) {
-                return h.name + '(' + h.date + ')';
+                return h.name + '·' + safeName(h.king) + '(' + h.date + ')';
             }).join('、'));
         }
         lines.push('【坐骑图鉴】登记在册的 ' + Object.keys(seen).length + ' 种');
@@ -3880,19 +4172,22 @@
         var lack = [];
         for (i = 0; i < MOUNT_NAMES.length; i++) if (!seen[MOUNT_NAMES[i]]) lack.push(MOUNT_NAMES[i]);
         if (lack.length) lines.push('  未收集：' + lack.join('、'));
-        /* 末尾追加两个操作项（菜单行号 = 上面 lines 的下标） */
-        var actRace = lines.length;
+        /* 末尾追加操作项（菜单行号 = lines 的下标） */
+        var actBase = lines.length;
         lines.push('');
-        lines.push('① 立即举办赛马大会（按名次发奖金）');
-        lines.push('② 喂马：消耗 500 粮草换 800 金');
+        if (rows.length) {
+            lines.push('① 报名下届赛马大会（选马+交粮草报名费）');
+            lines.push('② 喂马：花 100 粮草提升状态（上限 100，可治病）');
+        }
+        lines.push('③ 立即举办一届（看结果，不报名不发钱）');
+        lines.push('④ 粮草换钱：500 粮 → 800 金');
         menu(lines, 0, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) return;
-            if (ind === actRace + 1) {
-                var r = runRace(true);
-                if (r.length) { try { baye.alert(gbkSafe(r.join('\n')), function () { stableDialog(); }); } catch (e) { } }
-                return;
-            }
-            if (ind === actRace + 2) { feedMounts(); return; }
+            var k = ind - actBase;
+            if (k === 1) { raceSignUpDialog(); return; }               /* 报名 */
+            if (k === 2) { feedStableDialog(); return; }              /* 喂马提状态 */
+            if (k === 3) { raceRunNowDialog(); return; }              /* 立即举办 */
+            if (k === 4) { feedMounts(); return; }                    /* 粮换钱 */
         });
     }
 

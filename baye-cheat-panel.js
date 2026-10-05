@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.20.0';
+    var CHEAT_VERSION = '1.20.1';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -572,7 +572,9 @@
         forge: 1,            // 铁匠铺：装备强化（DNF 式）。强化等级独立记录，不改引擎面板数值
         forgePity: 1,        // 强化保底：连续失败 5 次后，下一次必定成功（防止无限掉级）
         forgeGuarantee: 0,   // 强化必定成功：成功率强制 100%（测试/刷满级用，费用照收）
-        forgeMount: 0,       // 允许强化纯坐骑：默认关（纯坐骑只加移动、不加伤害，强化收益为0）
+        forgeMount: 0,
+        raceOn: 1,          // 赛马大会（★必须显式给默认值：不在默认表里 flag() 会返回 falsy，功能永不启动）
+        aiForge: 1,         // AI 势力强化（同上）       // 允许强化纯坐骑：默认关（纯坐骑只加移动、不加伤害，强化收益为0）
         richMode: 0,          // 【已从面板移除】每月自动加钱（保留内部开关，资源管理菜单的手动加钱不受影响）
         richAmount: 3000,     // 每次加的钱/粮：立即加钱、立即加粮、每月自动都按这个额度
         moneyCap: 0,          // 【已从面板移除】0 = 自动校准；>0 = 手动指定金币上限（控制台可用）
@@ -1798,16 +1800,16 @@
         try { restoreResIfClamped(); } catch (e) { }
         /* 赛马提醒：1/4/7/10 月（赛马月的上一个月）提示玩家去报名 */
         try {
-            if (flag('raceOn')) {
-                var nm2 = baye.data.g_MonthDate || 0;
-                if (nm2 % 3 === 1 && myMounts().length) {
-                    setTimeout(function () {
-                        var msg = '下个月（' + ((nm2 % 12) + 1) + '月）有赛马大会！\n'
-                            + '现在可以去【马厩】报名（选马 + 交粮草报名费）。\n'
-                            + '冠军奖金 ' + RACE_PRIZE[0] + ' 金，不报名就拿不到。';
-                        try { baye.alert(gbkSafe(msg), function () { }); } catch (e6) { }
-                    }, 400);
-                }
+            /* 赛马提醒：距下届 ≤1 个月时弹一次（各赛季只提醒一次） */
+            if (flag('raceOn') && myMounts().length && raceNextMonths() <= 1
+                && RACE_REMIND_SEASON !== raceSeason()) {
+                RACE_REMIND_SEASON = raceSeason();
+                setTimeout(function () {
+                    var msg = '下个月有赛马大会！\n'
+                        + '现在可以去【马厩】报名（选马 + 交粮草报名费）。\n'
+                        + '冠军奖金 ' + RACE_PRIZE[0] + ' 金，不报名就拿不到。';
+                    try { baye.alert(gbkSafe(msg), function () { }); } catch (e6) { }
+                }, 500);
             }
         } catch (e7) { }
         /* AI 势力自主强化：让他们用各自的钱强化自己的武将（平衡：玩家不会被单方面碾压） */
@@ -2736,6 +2738,31 @@
         resetRunState(false);
         return undefined;
     }
+        setTimeout(function () { try { selfCheckFlags(); } catch (e) { } }, 800);
+
+    /* ---------- 启动自检：把「开关没生效」这类问题直接暴露在控制台 ----------
+       教训（v1.20）：raceOn / aiForge 因为没写进 DEFAULT_CFG，flag() 一直返回falsy，
+       赛马和 AI 强化**从头到尾没运行过**，而界面上完全看不出异常。
+       现在每次读档都核对一遍「UI 里列出的开关」是否都在默认表里有值。 */
+    function selfCheckFlags() {
+        try {
+            var missing = [], i, k;
+            if (typeof UI_ROWS === 'undefined' || !UI_ROWS) return missing;   /* UI_ROWS 声明在后面，运行时可能还没到*/
+            for (i = 0; i < UI_ROWS.length; i++) {
+                k = UI_ROWS[i].k;
+                if (typeof DEFAULT_CFG[k] === 'undefined') missing.push(k);
+            }
+            if (missing.length) {
+                log('★ 自检：以下开关缺少默认值，功能处于关闭状态 → ' + missing.join(', ')
+                    + '（请在设置里手动打开一次）');
+            }
+            if (typeof raceSeason === 'function' && flag('raceOn')) log('自检：赛马大会已开启，本月第 '
+                + (baye.data.g_MonthDate || 1) + ' 月，当前第 ' + (raceSeason() + 1)
+                + ' 届，' + (RACE_LAST_HELD === raceSeason() ? '本届已办过' : '本届还没办（月末自动举办）'));
+            return missing;
+        } catch (e) { return []; }
+    }
+
 
     function onTacticStage5() {
         var notes = [];
@@ -2762,8 +2789,11 @@
            现在月末弹窗播报「赛况动画 + 完整排名」，弹窗点确认后才回到游戏。*/
         try {
             if (flag('raceOn')) {
-                var md = baye.data.g_MonthDate || 0;
-                if (md % 3 === 0 && RACE_LAST_HELD !== raceSeason()) {
+                /* ★ 不再用 g_MonthDate % 3 判断：月末时引擎还没月结，
+                   g_MonthDate 仍是「当月」，导致 2 月末判断「不是 3 的倍数」而永远不办。
+                   改为「按赛季号办」，RACE_LAST_HELD 记录上次赛季，每届间隔 1 个赛季（3 个月）。 */
+                if (RACE_LAST_HELD !== raceSeason()
+                    && (RACE_LAST_HELD < 0 || raceSeason() - RACE_LAST_HELD >= 1)) {
                     var rr = raceRunOne(raceSeason());
                     RACE_ENTRY = [];                        /* 本届结束清空报名 */
                     /* 结果写月报（月报是文字版）+ 弹窗（动画版，一次只显示一段） */
@@ -3890,6 +3920,7 @@
     var RACE_SEASON = 0;        /* 赛季号（每 3 个月 +1） */
     var RACE_HISTORY = [];      /* 历届冠军{season,name,king,date} */
     var RACE_LAST_HELD = -1;    /* 上次举办的赛季号，避免同赛季重复发奖 */
+    var RACE_REMIND_SEASON = -1;  /* 上次提醒过的赛季号，避免每月重复弹提醒 */
     function raceSeason() { return Math.floor(gameMonthIndex() / 3); }
     function raceNextMonths() {
         var into = gameMonthIndex() % 3;

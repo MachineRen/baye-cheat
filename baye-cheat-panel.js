@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.20.6';
+    var CHEAT_VERSION = '1.20.7';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -1825,8 +1825,6 @@
         /* 资源防截断：此刻引擎上个月的月结已跑完，钱被削到了 30000。
            与上月末记录的额度对比，若确认是被削（非玩家自己花掉）就补回。*/
         try { restoreResIfClamped(); } catch (e) { }
-        /* 上月赛况：月初展示 */
-        try { tryShowPendingRace(true); } catch (e0r) { }
         /* 赛马提醒：距下届 ≤1 个月时弹一次（各赛季只提醒一次）。
            ★ 不用 setTimeout —— 在setTimeout 里调 baye.alert 会在引擎 UI 状态机
            之外异步弹窗，引擎此时可能在处理自己的回调栈，导致
@@ -2874,8 +2872,7 @@
         return undefined;
     }
         setTimeout(function () { try { selfCheckFlags(); } catch (e) { } }, 800);
-        /* 上月赛况：读档时展示（tacticStage1 在读档时不会触发，必须在这里挂） */
-        setTimeout(function () { try { tryShowPendingRace(true); } catch (e) { } }, 1400);
+        /* 读档不再自动弹上月赛况（v1.20.6：月末已直接弹，这里再弹会重复） */
 
     /* ---------- 启动自检：把「开关没生效」这类问题直接暴露在控制台 ----------
        教训（v1.20）：raceOn / aiForge 因为没写进 DEFAULT_CFG，flag() 一直返回falsy，
@@ -2944,17 +2941,16 @@
                     var rr = raceRunOne(raceSeason());
                     RACE_LAST_MD = md;                      /* 记录本月（防重复） */
                     RACE_ENTRY = [];                        /* 本届结束清空报名 */
-                    /* 结果写月报（月报是文字版）+ 弹窗（动画版，一次只显示一段） */
+                    /* 结果写月报 + **直接弹窗**（v1.20.6 定稿）
+                       回到 v1.20.2 的做法：办完立刻弹，不存任何中间缓存。
+                       （v1.20.5 存的 localStorage 是死数据：月末不弹、月初又不在读档时触发） */
                     notes = notes.concat(rr.lines || []);
-                    /* ★ 不在月末弹窗（v1.20.5）：
-                       tacticStage5 期间引擎正在结算、UI 队列会被结算界面抢占，
-                       表现为「历届冠军有数据但什么都没弹」。
-                       改成：月末只记录（写月报 + 存赛况），弹窗挪到**下个月月初**。*/
                     PENDING_RACE_SHOW = { anim: rr.anim || [], lines: rr.lines || [] };
-                    try { localStorage.setItem(skey('racepending_v1'),
-                        JSON.stringify({ y: baye.data.g_YearDate, m: baye.data.g_MonthDate,
-                            anim: PENDING_RACE_SHOW.anim, lines: PENDING_RACE_SHOW.lines })); } catch (e8) { }
-                    log('赛马：第' + (rr.lines && rr.lines.length ? '届' : '') + '已举办，赛况已存（下月月初展示）');
+                    try {
+                        log('赛马：第' + (raceSeason() + 1) + '届已开赛，' + (rr.lines || []).length
+                            + ' 条结果，开始弹窗…');
+                        playRaceAnim(rr.anim || [], rr.lines || [], function () { });
+                    } catch (e8) { log('赛马弹窗失败', e8); }
                 }
             }
         } catch (e4) { log('赛马大会异常', e4); }
@@ -3156,6 +3152,28 @@
     function safeName(id) {
         try { return baye.getPersonNameByID(id); } catch (e) { return '-'; }
     }
+    /* 手动补看上届赛况：自动弹窗被引擎吞掉时的兜底 */
+    function viewLastRace() {
+        var shown = false;
+        try {
+            var raw = localStorage.getItem(skey('racepending_v1'));
+            var pend = raw ? JSON.parse(raw) : null;
+            if (pend && pend.anim && pend.anim.length) {
+                shown = true;
+                playRaceAnim(['━━━ 上月赛马回顾 ━━━'].concat(pend.anim), pend.lines, function () { stableDialog(); });
+            }
+        } catch (e) { }
+        if (!shown) {
+            /* 没有缓存 = 说明是「弹窗被吞、没存上」→ 当场快闪一届 */
+            var r = raceRunOne(raceSeason());
+            if (r && r.anim && r.anim.length) {
+                playRaceAnim(r.anim, r.lines, function () { stableDialog(); });
+            } else {
+                alert2('本季还没有赛马记录。\n（赛马在 3/6/9/12 月月末举办）');
+            }
+        }
+    }
+
     /* ---------- 上月赛况展示（v1.20.6）----------
        之前挂在 tacticStage1 上，但**读档（onDidLoadGame）不会走 tacticStage1**，
        所以玩家读档进来什么也看不到；而且当时「先清缓存再弹」，
@@ -4575,8 +4593,6 @@
     }
 
     function stableDialog() {
-        /* 打开御马监时补展示上月赛况（读档/月初都没弹出来的兜底） */
-        try { tryShowPendingRace(true); } catch (e1r) { }
         var myKing = (baye.data.g_PlayerKing || 0) + 1;
         var persons = baye.data.g_Persons, rows = [], seen = {}, i, s, tid0, t, nm, mv;
         for (i = 0; i < persons.length; i++) {
@@ -4650,12 +4666,14 @@
         lines.push('① 报名赛马大会（各势力同场竞技，冠军 ' + RACE_PRIZE[0] + ' 金）');
         lines.push('② 喂马：花 100 粮草提升状态（上限 100，可治病）');
         lines.push('③ 御马校场：爱驹同场竞技，每匹收门票 ' + SELECT_TICKET + ' 金（每月一次）');
+        lines.push('④ 补看上届赛马赛况（自动弹窗被跳过时用这个）');
         menu(lines, 0, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) return;
             var k = ind - actBase;
             if (k === 1) { raceSignUpDialog(); return; }               /* 报名大会 */
             if (k === 2) { feedStableDialog(); return; }              /* 喂马提状态 */
             if (k === 3) { raceSelectDialog(); return; }              /* 选拔赛 */
+            if (k === 4) { viewLastRace(); return; }                  /* 补看赛况 */
         });
     }
 

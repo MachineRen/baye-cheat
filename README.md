@@ -39,4 +39,4 @@ GH_MSG="提交信息" GH_TOKEN=xxx node baye-push.js 文件…
 - 脚本按 git blob sha1 比对，相同自动跳过
 - Pages 构建约需 1–3 分钟，可用 `GET /repos/MachineRen/baye-cheat/pages/builds/latest` 轮询
 
-> 构建标记：2026-10-05 15:44:45（v1.20.5 君主名修复重推）
+> 重推：2026-10-05T15:51:03.809Z

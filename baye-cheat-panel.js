@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.21.0';
+    var CHEAT_VERSION = '1.21.1';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -4616,20 +4616,23 @@
             }
         }
         lines.push('');
+        /*★ 菜单项：用 MENU_ACTIONS 数组 + 起始下标做**0 基**索引映射。
+             之前的 bug：actBase = lines.length 之后 push 的第一项其索引就是 actBase，
+             但我判断时从 k === 1 开始 → 全部偏移 1（点「报名」没反应、
+             点「喂马」进报名、点「历届冠军」进校场）。
+             另：每项文字压到 ≤12 汉字（MENU_MAX_HALF=24），保证不被 fitMenuLines 折行。 */
         var actBase = lines.length;
-        lines.push('① 报名赛马大会');
-        lines.push('② 喂马（100粮草+6状态）');
-        lines.push('③ 办御马校场（收门票）');
-        lines.push('④ 历届冠军');
-        lines.push('⑤ 赛马规则');
+        var MENU_ACTIONS = ['① 报名赛马大会', '② 喂马（100粮草）', '③ 办御马校场',
+            '④ 历届冠军', '⑤ 赛马规则'];
+        for (var mi = 0; mi < MENU_ACTIONS.length; mi++) lines.push(MENU_ACTIONS[mi]);
         menu(lines, 0, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) return;
-            var k = ind - actBase;
-            if (k === 1) { raceSignUpDialog(); return; }
-            if (k === 2) { feedStableDialog(); return; }
-            if (k === 3) { raceSelectDialog(); return; }
-            if (k === 4) { raceHistoryDialog(); return; }
-            if (k === 5) { raceRuleDialog(); return; }
+            var k = ind - actBase;                /* 0 基：k=0 就是「① 报名」 */
+            if (k === 0) { raceSignUpDialog(); return; }
+            if (k === 1) { feedStableDialog(); return; }
+            if (k === 2) { raceSelectDialog(); return; }
+            if (k === 3) { raceHistoryDialog(); return; }
+            if (k === 4) { raceRuleDialog(); return; }
         });
     }
     /* 历届冠军：独立菜单，每届两行（马名 / 君主+日期） */

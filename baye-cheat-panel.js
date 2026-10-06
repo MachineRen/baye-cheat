@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.22.0';
+    var CHEAT_VERSION = '1.22.1';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -790,14 +790,21 @@
     /* 全屏列表（居中）：宽高用引擎实际分辨率推导，别再用 225x135 这种超屏值。
        回调索引映射回原始条目：长行折行后列表会变长，若不映射，
        点「花钱强化？」「再强化一次？」这类按索引判断的按钮就会错位失效。 */
-    function menu(items, init, cb) {
+    function menu(items, init, cb, reopen) {
         /* 无回调也要能开菜单（查看月报/排行/图鉴/版本等都是纯展示）——
            少了这一层守卫，v1.11.1 的索引映射包装会在取消时抛
            「cb is not a function」并把引擎菜单状态机卡死。 */
         if (typeof cb !== 'function') cb = function () { };
         var fit = fitMenuLines(items);
         baye.centerChoose(SW() - 8, SH() - 8, fit.lines, init || 0, function (ind) {
-            if (ind === baye.None || ind === 65535 || ind === undefined) { cb(ind); return; }
+            if (ind === baye.None || ind === 65535 || ind === undefined) {
+                cb(ind);
+                /* v1.22.1：传了 reopen 就**重开本菜单**，而不是直接消失
+                   （用户第 3 条：点没有功能的行，界面不应该消失）。
+                   引擎的 centerChoose 是模态的，取消回调后紧接着重开即可。 */
+                if (typeof reopen === 'function') { try { reopen(); } catch (e) { } }
+                return;
+            }
             cb(fit.map[ind] === undefined ? ind : fit.map[ind]);
         });
     }
@@ -1841,14 +1848,15 @@
                 && RACE_REMIND_SEASON !== mdR) {
                 RACE_REMIND_SEASON = mdR;
                 uiQueue(function () {
-                    alert2('下个月有赛马大会！\n'
-                        + '现在可以去【御马监】报名（选马 + 交粮草报名费）。\n'
-                        + '冠军奖金 ' + RACE_PRIZE[0] + ' 金，不报名就拿不到。');
+                    /* v1.22.1：取消报名制，不再提示「去报名」 */
+                    alert2('下个月有赛马大会！\n各势力自动出马，无需报名。\n'
+                        + '冠军奖金 ' + RACE_PRIZE[0] + ' 金');
                 });
             }
         } catch (e7) { }
         /* AI 势力：先补坐骑（赛马要有马可跑），再自主强化 */
-        try { aiGiveMounts(); } catch (e0) { }
+        /* v1.22.1：不再给 AI 配装备（aiGiveMounts / aiGiveEquip 已停用）。
+           aiForgeAll 保留 —— 它只**强化武将已有的装备**，不动装备本身。 */
         try { aiForgeAll(); } catch (e) { }
         var notes = [];
         if (appliedOnce) {
@@ -2682,48 +2690,16 @@
         } catch (e) { return 0; }
     }
     /* 给 AI 武将的指定槽位配一件可强化的装备（从道具表里找属性和够高的） */
+    /* ★★ v1.22.1 停用：AI 自动配装备。
+       v1.15 引入它是为了让「AI 将武也能强化上」，但**破坏了游戏数据**（用户实测）：
+         · 把城池闲置道具（g_GoodsQueue）直接塞进 p.Equip[] → 道具从城池凭空消失
+         · 跨城池搜到的道具被它抓走乱分配 → 搜物表失效
+         · 装备分布出现「+7（公孙度）」这类凭空多出来的武器（强化等级来自 FORGE 表，
+           但槽位已错乱，看起来像没武器却有 +7）
+       现在**完全不碰任何武将的装备**：强化只作用于武将原本就有的装备。
+       如需恢复，把下面 return 换成原来的实现（但不要再对玩家城池道具生效）。 */
     function aiGiveEquip(p, slot, wantMount, exclude) {
-        try {
-            var tools = baye.data.g_Tools, i, t, score, nm2, cand = [];
-            var skip = exclude || null;
-            for (i = 1; i < tools.length && i < 200; i++) {
-                t = tools[i];
-                if (!t || t.useflag) continue;
-                score = (t.at || 0) * 2 + (t.iq || 0) + (t.move || 0);
-                if (score <= 0) continue;
-                if (wantMount) {
-                    /* 要坐骑：只在 29 匹战马里挑（文档清单） */
-                    try { nm2 = gbkSafe(baye.getToolName(i)) || ''; } catch (e3) { nm2 = ''; }
-                    if (!isMountName(nm2)) continue;
-                    /* ★ 排除已分配过的坐骑名（道具下标是共享的，
-                       不按名字去重就会「多个势力拿到同一款」） */
-                    if (skip && skip[nm2]) continue;
-                } else if (toolTypeName(i) === '纯坐骑') {
-                    continue;                                   /* 兵器/兵书：不要纯坐骑 */
-                }
-                cand.push(i);
-            }
-            if (!cand.length) return 0;
-            /* ★ 随机取，不能「取最高分」—— 否则每次都挑同一件道具，
-               会让所有势力都拿到同款（实测 6 匹马里出现 3 匹的卢）。
-               坐骑：纯随机；兵器/兵书：在最高分档里随机。 */
-            var best;
-            if (wantMount) {
-                best = cand[rand(cand.length)];
-            } else {
-                var top = [], maxSc = -1, tt2, sc2;
-                for (i = 0; i < cand.length; i++) {
-                    tt2 = tools[cand[i]];
-                    sc2 = (tt2.at || 0) * 2 + (tt2.iq || 0) + (tt2.move || 0);
-                    if (sc2 > maxSc) { maxSc = sc2; top = [cand[i]]; }
-                    else if (sc2 === maxSc) top.push(cand[i]);
-                }
-                best = top.length ? top[rand(top.length)] : cand[rand(cand.length)];
-            }
-            if (!p.Equip) p.Equip = [0, 0];
-            p.Equip[slot] = best + 1;
-            return best + 1;
-        } catch (e) { return 0; }
+        return 0;
     }
 
     /* AI 强化：每月给所有 AI 势力跑一遍 */
@@ -2748,6 +2724,10 @@
         try { localStorage.setItem(skey('aimount_v1'), JSON.stringify(AI_MOUNT_DONE || {})); } catch (e) { }
     }
     function aiGiveMounts() {
+        /* v1.22.1 一并停用：它靠 aiGiveEquip 写装备槽，同样会搬走城池道具。
+           赛马参赛马匹只认「武将原本就有的坐骑」。 */
+        return 0;
+        /* eslint-disable no-unreachable */
         if (!flag('raceOn')) return 0;
         var DONE = aiMountDone();
         var cities = baye.data.g_Cities, persons = baye.data.g_Persons;
@@ -4391,6 +4371,7 @@
             var rq = runners[q];
             rankSeg.push(pad('' + (q + 1), 3) + rq.nm + '　'
                 + racePrizeOf(q + 1) + '金'
+                + '　速度' + rq.mv + '状态' + rq.st.s
                 + (rq.ev ? '　⚠' + rq.ev.txt : ''));
         }
         anim.push(rankSeg.join('\n'));
@@ -4479,56 +4460,33 @@
        背景半透明（地图文字会透出来）、行宽约 14 汉字超出就换行错位。
        menu 走 centerChoose(SW()-8, SH()-8)，有完整边框、自动折行、行高自适应。 */
     function playRaceAnim(anim, lines, onDone) {
-        /* 串行播放，每屏：
-           · **2 秒自动翻页**（末屏 5 秒，收益明细要看清）；按确认可立即跳过等待
-           · 末屏是**收益汇总**（用户第 12 条：不用再显示冠军）
-           · 倒计时显示在「继续」那一行上，让玩家知道会自动走 */
+        /* 串行播放，一段一屏，点「继续」进入下一段。
+           ★ v1.22.1 修「界面乱套」：原来在 setTimeout 里**再调一次 centerChoose**
+             来模拟自动翻页 → 两个模态菜单**叠在一起**，
+             表现为：页码乱跳（1/22 → 9/22 → 15/22）、界面位移、
+             点左点右都在动、自动翻页也失效。
+             现在**去掉自动翻页**，只在菜单末尾放「继续」行，页码固定顺序递增。
+           ★ 排名页不再拆成多屏（原来 lines 一行一条 → 一次一名，翻十几屏）。 */
         var segs = anim.slice();
-        if (lines && lines.length) {
-            segs = segs.concat([''], lines);
-        }
         var i = 0;
+        function finish() { if (onDone) { try { onDone(); } catch (e) { } } }
         function next() {
-            if (i >= segs.length) {
-                if (onDone) { try { onDone(); } catch (e) { } }
-                return;
-            }
+            if (i >= segs.length) { finish(); return; }
             var seg = segs[i++];
-            if (!seg || !String(seg).length) { next(); return; }
-            var last = (i >= segs.length);
+            if (seg === undefined || seg === null || !String(seg).length) { next(); return; }
             var items = String(seg).split('\n');
             items.push('');
-            items.push('─ 继续 ' + i + '/' + segs.length
-                + (last ? '（5秒）' : '（2秒）') + ' ─');
-            var done = false;
+            items.push(i < segs.length ? ('─ 继续（' + i + '/' + segs.length + '）─')
+                                       : '─ 完成 ─');
             menu(items, items.length - 1, function (ind) {
-                if (done) return;
-                done = true;
-                if (ind === baye.None || ind === 65535 || ind === undefined) { i = segs.length; }
+                if (ind === baye.None || ind === 65535 || ind === undefined) {
+                    /*取消/返回键：结束整个播报（用户第 5 条：支持返回上一级） */
+                    i = segs.length;
+                    finish();
+                    return;
+                }
                 next();
             });
-            /* 自动翻页：引擎 menu 是模态的，用 centerChoose 重复一次来模拟"自动按确认" */
-            if (last) {
-                setTimeout(function () {
-                    if (done) return;
-                    done = true;
-                    try {
-                        baye.centerChoose(SW() - 8, SH() - 8,
-                            fitMenuLines(items).lines, items.length - 1, function () { });
-                    } catch (e2) { }
-                    next();
-                }, 5000);
-            } else {
-                setTimeout(function () {
-                    if (done) return;
-                    done = true;
-                    try {
-                        baye.centerChoose(SW() - 8, SH() - 8,
-                            fitMenuLines(items).lines, items.length - 1, function () { });
-                    } catch (e3) { }
-                    next();
-                }, 2000);
-            }
         }
         next();
     }
@@ -4579,38 +4537,37 @@
         });
         runners.sort(function (a, b) { return b.score - a.score; });
         runners.forEach(function (r, i) { r.rank = i + 1; });
-        /* 赛况（复用分段动画，措辞改成选拔赛） */
-        var anim = [];
-        anim.push('━━ 御马校场 · 起跑 ━━\n\n'
-            + '　' + use.length + ' 匹马在都城赛场集合\n'
-            + '　观众买票入场（门票 ' + SELECT_TICKET + ' 金）\n'
-            + '　今日赛事由你自己主持');
-        anim.push('　　━━发 令 ━━\n\n　砰！发令枪响——\n　' + use.length + ' 匹马冲出闸门！\n\n　起跑领先：' + runners[0].nm);
-        var mid = runners.slice().sort(function (a, b) { return b.score * (0.85 + Math.random() * 0.3) - a.score * (0.85 + Math.random() * 0.3); });
-        anim.push('　　— 中段 —\n\n'
-            + (runners.some(function (r) { return r.ev; })
-                ? '　⚡ 场上出现状况！' + (runners.filter(function (r) { return r.ev; })[0] || {}).nm
-                    + (runners.filter(function (r) { return r.ev; })[0] || {}).ev.txt + '\n'
-                : '　中段节奏稳健\n')
-            + '\n　　中段领先：' + mid[0].nm);
-        var late = runners.slice().sort(function (a, b) { return (b.score + (Math.random() - 0.5) * 20) - (a.score + (Math.random() - 0.5) * 20); });
-        anim.push('　　— 最后冲刺 —\n\n'
-            + (late[0].nm !== mid[0].nm ? '　🔥 ' + late[0].nm + ' 突然发力反超 ' + mid[0].nm + '！' : '　格局未变，领先者守住\n')
-            + '\n　　冲刺阶段：' + late[0].nm + '暂列第一');
-        anim.push('　　━━ 冲 线 ━━\n\n'
-            + '　🏆 冠军：' + runners[0].nm + '　（移动+' + runners[0].mv + ' 状态' + runners[0].st.s + '）\n'
-            + '　门票收入 +' + got + ' 金\n\n'
-            + '　（点确认查看全部排名）');
-        /* 排名 + 奖金（选拔赛也发奖，但比大会低，只算门票为主） */
-        var lines = ['【御马校场】' + use.length + ' 匹参赛 · 门票 +' + got + ' 金', ''];
-        runners.forEach(function (r) {
-            lines.push('  第' + r.rank + '名  ' + pad(r.nm, 8) + ' 移动+' + r.mv + '  状态' + r.st.s
-                + (r.ev ? '  ⚠' + r.ev.txt : ''));
-        });
-        /* 冠军奖励（低于大会，因为门票才是主收益） */
-        if (got > 0 || true) { /* 门票已入账 */ }
-        lines.push('');
-        lines.push('  冠军：' + runners[0].nm + '　门票 +' + got + ' 金');
+        /* 赛况（v1.22.1重写）：与赛马大会同一套排版。
+           ★ 去掉购票等内部说明（用户第 6 条）。
+           ★ 排名**一行一名连列**（含速度/状态），不是一屏一名。 */
+        var anim = [], seg, q2, ord2;
+        ord2 = runners.slice().sort(function (x, y) { return y.score - x.score; });
+
+        anim.push('━━ 御马校场 · 起跑 ━━\n'
+            + use.length + ' 匹爱驹入场\n'
+            + '发令枪响！\n'
+            + '领先：' + ord2[0].nm);
+
+        anim.push('━━ 比 赛 ━━\n'
+            + '第 1：' + ord2[0].nm + '\n'
+            + '第 2：' + (ord2[1] ? ord2[1].nm : '—')
+            + '\n状态 ' + ord2[0].st.s);
+
+        anim.push('━━ 冲 线 ━━\n'
+            + '🏆 冠军：' + runners[0].nm + '\n'
+            + '亚军：' + (runners[1] ? runners[1].nm : '—')
+            + '\n门票收入 +' + got + ' 金');
+
+        var rankSeg = ['━━ 全部排名 ━━'];
+        for (q2 = 0; q2 < runners.length; q2++) {
+            rankSeg.push(pad('' + (q2 + 1), 3) + runners[q2].nm
+                + '　速度' + runners[q2].mv + '状态' + runners[q2].st.s
+                + (runners[q2].ev ? '　⚠' + runners[q2].ev.txt : ''));
+        }
+        anim.push(rankSeg.join('\n'));
+
+        /* 收益明细（排名已并入上面的 rankSeg，这里只报收益） */
+        var lines = ['门票收入 +' + got + ' 金'];
         /* 状态回落 */
         runners.forEach(function (r) {
             var st = mountState(myKing, r.nm);
@@ -4633,10 +4590,10 @@
         }
         var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
         var canRun = SELECT_LAST_MONTH !== gameMonthIndex();
-        var lines = ['━━ 御马校场 ━━', '', '爱驹同场竞技', '每月可办一次', '门票收入 ' + SELECT_TICKET + ' 金', ''];
+        var lines = ['━━ 御马校场 ━━', '', '爱驹同场竞技', '每月可办一次', ''];
         for (var i = 0; i < pool.length; i++) {
             var st = mountState(myKing, pool[i].nm);
-            lines.push('  ' + pad(pool[i].nm, 8) + ' 速' + pool[i].mv + '　状' + st.s + (st.sick ? '·病' : ''));
+            lines.push(pool[i].nm + '　速度' + pool[i].mv + '状态' + st.s + (st.sick ? '·病' : ''));
         }
         lines.push('');
         lines.push(canRun ? '▶ 立即开赛' : '（本月已办过）');
@@ -4677,21 +4634,21 @@
         lines.push(my ? ('现有爱驹 ' + my + ' 匹') : '（还没有马匹可养）');
         lines.push('');
         var actBase = lines.length;
-        var MENU_ACTIONS = ['① 马场（查看 / 喂马）', '② 御马校场', '③ 历届冠军', '④ 赛马规则'];
+        var MENU_ACTIONS = ['① 御马苑（喂马）', '② 御马校场', '③ 历届冠军', '④ 赛马规则'];
         for (var mi = 0; mi < MENU_ACTIONS.length; mi++) lines.push(MENU_ACTIONS[mi]);
         menu(lines, 0, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) return;
             var k = ind - actBase;                /* 0 基 */
-            if (k === 0) { stableFieldDialog(); return; }
+            if (k === 0) { imperialGardenDialog(); return; }
             if (k === 1) { raceSelectDialog(); return; }
             if (k === 2) { raceHistoryDialog(); return; }
             if (k === 3) { raceRuleDialog(); return; }
-        });
+        }, function () { stableDialog(); });
     }
     /* ---------- ① 马场：查看全部马匹 + 喂食提状态 / 治病 ----------
        点某匹马 → 立即喂食（花 100 粮草，状态 +6，可解除病态），喂完留在本页可继续喂别的。
        点「返回」→ 回御马监。 */
-    function stableFieldDialog(msg) {
+    function imperialGardenDialog(msg) {
         var myKing = (baye.data.g_PlayerKing || 0) + 1;
         var pool = myMounts();
         if (!pool.length) {
@@ -4708,7 +4665,9 @@
         for (var i = 0; i < pool.length; i++) {
             var st = mountState(myKing, pool[i].nm);
             var mark = st.sick ? '·病' : (st.s >= 100 ? '·满' : '');
-            lines.push('  ' + pad(pool[i].nm, 8) + ' 速' + pool[i].mv + '　状' + st.s + mark);
+            /* pad() 会对短名补前导空格（白驹前多一格），这里不用 pad：
+               名字 + 两个全角空格分隔，视觉对齐。 */
+            lines.push(pool[i].nm + '　速度' + pool[i].mv + '状态' + st.s + mark);
         }
         lines.push('');
         lines.push('─ 返回 ─');
@@ -4723,11 +4682,11 @@
                 if (!r.ok) { alert2(r.msg); return; }
                 cy.Food = (Number(cy.Food) || 0) - 100;
                 try { saveRaceState(); } catch (e) { }
-                stableFieldDialog(r.msg);       /* 留在本页，可继续喂下一匹 */
+                imperialGardenDialog(r.msg);       /* 留在本页，可继续喂下一匹 */
                 return;
             }
             stableDialog();
-        });
+        }, function () { imperialGardenDialog(); });
     }
     /* 历届冠军：独立菜单，每届两行 */
     function raceHistoryDialog() {
@@ -4763,7 +4722,7 @@
         r.push('　11 名以后 ' + RACE_PRIZE_MIN);
         r.push('');
         r.push('─ 返回 ─');
-        menu(r, 0, function () { stableDialog(); });
+        menu(r, 0, function () { stableDialog(); }, function () { raceRuleDialog(); });
     }
     /* 历届冠军：独立菜单，每届两行（马名 / 君主+日期） */
     function raceHistoryDialog() {
@@ -5456,6 +5415,12 @@
     /* ======================== 8. 设置面板（HTML 悬浮层） ======================== */
 
     var UI_CSS = [
+        /* 数值型配置（滑动条 + ±微调）—— v1.22.1 */
+        '#bayeCheatDock .row.num{align-items:center}',
+        '#bayeCheatDock .numwrap{display:flex;align-items:center;gap:6px;flex-shrink:0}',
+        '#bayeCheatDock .rng{width:96px;accent-color:#22a06b;cursor:pointer}',
+        '#bayeCheatDock .nval{display:inline-block;min-width:26px;text-align:center;font-weight:700;font-size:14px;color:#22a06b}',
+        '#bayeCheatDock .nbtn{width:24px;height:24px;border-radius:12px;border:1px solid rgba(0,0,0,.2);background:#fff;color:#333;font-size:15px;line-height:1;cursor:pointer;padding:0}',
         /* 默认锚在右下角（v1.11.1）：图标可拖动，拖动后按拖动位置记忆 */
         '#bayeCheatDock{position:fixed;right:10px;bottom:12px;z-index:2147483000;font:13px/1.6 -apple-system,"PingFang SC",sans-serif}',
         '#bayeCheatDock button{font:inherit}',
@@ -5516,7 +5481,8 @@
         { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（等级不设上限），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
         { k: 'forgePity', t: '强化保底', d: '默认开启。连续失败 8 次后下一次必定成功，避免高等级陷入无限掉级（+20 以上成功率仅 4%）' },
         { k: 'raceOn', t: '赛马大会', d: '默认开启。各势力非在野马匹自动参赛（同月内没被搜索到的马不参加），无需报名。奖金前十六名见【赛马规则】' },
-        { k: 'raceEvery', t: '赛马间隔（月）', d: '每隔几个月办一届赛马大会。0 = 关闭，1 = 每月都办，12 = 每年一届。默认 3。' },
+        { k: 'raceEvery', t: '赛马间隔（月）', num: 1, min: 0, max: 12, step: 1, def: 3,
+        d: '每隔几个月办一届赛马大会。0 = 关闭，1 = 每月都办，12 = 每年一届。默认 3。' },
         { k: 'aiForge', t: 'AI 势力也会强化', d: '默认开启。每个 AI 势力用自己的城池收入强化自己的武将（花钱按玩家的 34% 计价、成功率低 8 个百分点、最高等级=城池数+6）。这样玩家 +20 时 AI 也在成长，不会单方面碾压；同时 AI 变强会消耗它的经济 → 出征变慢' },
         { k: 'levelBoost', t: '武将等级提升', d: '每月给全部己方武将 +30 经验（引擎经验条满 100 即升 1 级，等级上限由引擎 maxLevel 决定，默认 30）' },
         { k: 'forgeGuarantee', t: '强化必定成功', d: '默认关。开启后强化成功率强制 100%（费用照收），配合铁匠铺快速刷高等级用' },
@@ -5538,6 +5504,25 @@
         var html = '<button class="bd" id="bayeCheatBtn" title="星助手设置（可拖动）">⚙</button><div class="panel">';
         html += '<h4>功能开关</h4>';
         UI_ROWS.forEach(function (r) {
+            /* v1.22.1：区分**开关型**与**数值型**。
+               原来一律渲染成开关 → raceEvery（0-12 的数值）点它只会开/关，根本选不了值
+               （用户第 9 条：「滑动条呢，我怎么选」）。
+               现在数值型渲染成 range 滑动条 + 数字显示 + 「−/+」微调。 */
+            if (r.num) {
+                var cur = parseInt(cfg[r.k], 10);
+                if (isNaN(cur)) cur = (r.def || 0);
+                html += '<div class="row num"><div><div class="t">' + r.t + '</div>'
+                    + '<div class="d">' + r.d + '</div></div>'
+                    + '<div class="numwrap">'
+                    + '<button class="nbtn" data-nk="' + r.k + '" data-d="-1">−</button>'
+                    + '<input type="range" class="rng" data-k="' + r.k + '"'
+                    + ' min="' + (r.min || 0) + '" max="' + (r.max || 12) + '"'
+                    + ' step="' + (r.step || 1) + '" value="' + cur + '">'
+                    + '<span class="nval" id="nv_' + r.k + '">' + cur + '</span>'
+                    + '<button class="nbtn" data-nk="' + r.k + '" data-d="1">+</button>'
+                    + '</div></div>';
+                return;
+            }
             html += '<div class="row"><div><div class="t">' + r.t + '</div><div class="d">' + r.d + '</div></div>'
                 + '<button class="sw' + (flag(r.k) ? ' on' : '') + '" data-k="' + r.k + '"><i></i></button></div>';
         });
@@ -5738,6 +5723,33 @@
                 try { applyDeathRate(); } catch (e) { }
                 refreshDrBtns();
                 log('战死概率 = ' + cfg.deathRate + '%');
+            };
+        });
+        /* 数值型配置：滑动条 + ± 微调（v1.22.1） */
+        function setNum(k, v, row) {
+            var mn = parseInt(row && row.min, 10) || 0;
+            var mx = parseInt(row && row.max, 10) || 12;
+            v = parseInt(v, 10); if (isNaN(v)) v = mn;
+            if (v < mn) v = mn; if (v > mx) v = mx;
+            cfg[k] = v; saveCfg();
+            var lab = document.getElementById('nv_' + k);
+            if (lab) lab.textContent = v;
+            var rng = wrap.querySelector('.rng[data-k="' + k + '"]');
+            if (rng && parseInt(rng.value, 10) !== v) rng.value = v;
+            refreshNumHints && refreshNumHints();
+        }
+        function rowOf(k) {
+            for (var ri = 0; ri < UI_ROWS.length; ri++) if (UI_ROWS[ri].k === k) return UI_ROWS[ri];
+            return null;
+        }
+        each(wrap.querySelectorAll('.rng[data-k]'), function (r) {
+            r.oninput = function () { setNum(r.getAttribute('data-k'), r.value, rowOf(r.getAttribute('data-k'))); };
+        });
+        each(wrap.querySelectorAll('.nbtn[data-nk]'), function (b) {
+            b.onclick = function () {
+                var k = b.getAttribute('data-nk'), d = parseInt(b.getAttribute('data-d'), 10);
+                var row = rowOf(k), rng = wrap.querySelector('.rng[data-k="' + k + '"]');
+                setNum(k, (parseInt(cfg[k], 10) || 0) + d, row);
             };
         });
         each(wrap.querySelectorAll('.fn button[data-fn]'), function (b) {

@@ -1,5 +1,5 @@
 /* ============================================================================
-   三国霸业 · 金手指 v1.0（外挂版 / 不改源码）
+   三国霸业 · 星助手 v1.0（Star Assistant · 游戏优化 / 不改源码）
    ----------------------------------------------------------------------------
    适用：https://baye.bbkgames.com/index.html （平衡版2.1三国战纪 / 平衡版2.1修罗模式）
    用法：1) 打开游戏页 → 控制台粘贴本文件 → 回车；或 2) 做成书签点击
@@ -23,11 +23,11 @@
     if (typeof window === 'undefined') return;
 
     if (window.bayeCheat && window.bayeCheat.version) {
-        console.log('[金手指] 已加载 v' + window.bayeCheat.version + '，本次跳过');
+        console.log('[星助手] 已加载 v' + window.bayeCheat.version + '，本次跳过');
         return;
     }
 
-    var CHEAT_VERSION = '1.21.1';
+    var CHEAT_VERSION = '1.22.0';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -49,7 +49,7 @@
             window.baye = window.baye || {};
             window.baye.preScriptInit = function () {
                 try { if (pre) pre(); } catch (e) { }
-                try { install(); } catch (e) { console.error('[金手指] install 失败', e); }
+                try { install(); } catch (e) { console.error('[星助手] install 失败', e); }
             };
             /* 引擎已跑过 preScriptInit 但 data 还没就绪的兜底：轮询等待 */
             TIMER = setInterval(function () {
@@ -220,12 +220,12 @@
                 log('钩子已重装');
             }
         };
-        log('三国霸业·金手指 v' + CHEAT_VERSION + ' 已加载（点右上角 ⚙ 打开设置）');
+        log('三国霸业·星助手 v' + CHEAT_VERSION + ' 已加载（点右上角 ⚙ 打开设置）');
     }
 
     function log() {
         var a = Array.prototype.slice.call(arguments);
-        a.unshift('[金手指]');
+        a.unshift('[星助手]');
         console.log.apply(console, a);
     }
 
@@ -575,6 +575,7 @@
         forgeGuarantee: 0,   // 强化必定成功：成功率强制 100%（测试/刷满级用，费用照收）
         forgeMount: 0,
         raceOn: 1,          // 赛马大会（★必须显式给默认值：不在默认表里 flag() 会返回 falsy，功能永不启动）
+        raceEvery: 3,      // 赛马间隔（月）0=关闭 1~12，默认 3          // 赛马大会（★必须显式给默认值：不在默认表里 flag() 会返回 falsy，功能永不启动）
         aiForge: 1,         // AI 势力强化（同上）       // 允许强化纯坐骑：默认关（纯坐骑只加移动、不加伤害，强化收益为0）
         richMode: 0,          // 【已从面板移除】每月自动加钱（保留内部开关，资源管理菜单的手动加钱不受影响）
         richAmount: 3000,     // 每次加的钱/粮：立即加钱、立即加粮、每月自动都按这个额度
@@ -1037,7 +1038,7 @@
             rescued.push(nameOf(i));
         }
         if (rescued.length && !silent) {
-            alert2('【重伤撤退】以下武将本已阵亡，已按金手指规则找回：' + rescued.join('、'));
+            alert2('【重伤撤退】以下武将本已阵亡，已按星助手规则找回：' + rescued.join('、'));
         }
         return rescued;
     }
@@ -2610,7 +2611,12 @@
         }
         PENDING_PLACE = {}; PENDING_SORTIE = []; BELONG_SNAP = null; DISASTER_SNAP = null;
         WAR_LAST = {}; WAR_COUNT = {};         /* 出征节奏：上次进攻月份 / 累计次数 */
-        RACE_SEASON = 0; RACE_HISTORY = []; RACE_LAST_HELD = -1;
+        /* 换档：赛马数据随档清空并重新载入（用户第 7 条：跟随存档保存和清除） */
+        RACE_SEASON = 0; RACE_LAST_HELD = -1;
+        RACE_HISTORY = loadRaceHistory();
+        try { RACE_ST = {}; } catch (e0) { }
+        RACE_ST = (function () { var o = {}; try { var r2 = localStorage.getItem(skey('racestate_v1')); if (r2) o = JSON.parse(r2) || {}; } catch (e1) { } return o; })();
+        saveRaceHistory();
         ATTACKED.month = ''; ATTACKED.targets = {};
         ATTACK_SRC = {};                /* 进攻出发城台账 */
         log('已重置本局运行数据（月报/台账/跟踪基线' + (isNewGame ? '，强化记录已清空' : '') + '）');
@@ -2939,7 +2945,9 @@
                    导致 2/5/8/11 月末被误判成「新赛季开始」而提前办赛。
                    RACE_COUNT 做二次兜底：同一个月绝不可能办两届。 */
                 var md = baye.data.g_MonthDate || 0;
-                if (md > 0 && md % 3 === 0 && RACE_LAST_MD !== md) {
+                var iv = raceInterval();
+                /* v1.22：间隔可配（0=关闭，1~12 月） */
+                if (iv > 0 && md > 0 && md % iv === 0 && RACE_LAST_MD !== md) {
                     var rr = raceRunOne(raceSeason());
                     RACE_LAST_MD = md;                      /* 记录本月（防重复） */
                     RACE_ENTRY = [];                        /* 本届结束清空报名 */
@@ -2982,7 +2990,7 @@
     var info = {
         monthReport: [],
         lastSnapshot: {},
-        version: '金手指 v' + CHEAT_VERSION + ' · 适配 balance2.01 / balance2.01-max'
+        version: '星助手 v' + CHEAT_VERSION + ' · 适配 balance2.01 / balance2.01-max'
     };
 
     function onShowMainHelp() {
@@ -3023,7 +3031,7 @@
     /* 每行别超过 30 个半角（引擎会把超宽行自动折行，列表会乱） */
     function showVersion() {
         menu([
-            '金手指 v' + CHEAT_VERSION,
+            '星助手 v' + CHEAT_VERSION,
             '适配：三国战纪 / 修罗',
             '',
             '托管结算 fightCountWinner',
@@ -3043,11 +3051,14 @@
         var names = [], i;
         for (i = 0; i < cities.length; i++) names.push(cityName(i));
 
-        var listW = 24;                          /* 右侧列表宽：2 个汉字/行，同霸哥版 */
+        /* 右侧列表宽（像素）：v1.22 由 24 收窄到 18 —— 之前 24 把详情区挤到只剩半屏，
+           用户看到「已装4：+1（田豫）…后面还剩挺多空间就换行」。*/
+        var listW = 18;
         var listX = SW() - listW - 2;
         var pad2 = 3;
         /* LCD 字库半角 6px、全角 12px：详情区每行可容纳的半角数 = 可用像素 / 6
            （之前把像素宽直接当半角数用，折行完全没生效，长行溢出压到列表上） */
+        /* LCD 字库：半角 6px / 全角 12px → 半角数 = 可用像素 / 6 */
         var innerHalf = Math.floor((listX - pad2 * 2) / 6);
         var lineH = 13;
         var maxLines = Math.floor((SH() - 8) / lineH);
@@ -3139,12 +3150,15 @@
             var p = personAt(list[j]);
             if (!p) continue;
             var t = [];
-            /* 名称后缀强化等级（+N）—— 引擎道具本身没有这个字段，靠本脚本的 FORGE 表 */
+            /* 强化等级写在**道具名前面**（用户第 13 条：应显示「+1双股剑」而不是「双股剑+1」）。
+               格式：+1双股剑(刘备)  —— 之前写「双股剑+1(刘备)」，
+               多个装备拼在一起时「…、望月枪(公孙瓒)、追风洗银枪+玉兰白龙驹(赵云)」
+               括号位置含糊，看起来像「+1(田豫)」= 田豫有装备，实际是那件装备 +1。 */
             var lv0 = forgeLv(list[j], 0);
             var lv1 = forgeLv(list[j], 1);
-            if (p.Equip[0]) t.push(gbkSafe(baye.getToolName(p.Equip[0] - 1)) + (lv0 > 0 ? ' +' + lv0 : ''));
-            if (p.Equip[1]) t.push(gbkSafe(baye.getToolName(p.Equip[1] - 1)) + (lv1 > 0 ? ' +' + lv1 : ''));
-            if (t.length) eq.push(t.join('+') + '(' + nameOf(list[j]) + ')');
+            if (p.Equip[0]) t.push((lv0 > 0 ? '+' + lv0 : '') + gbkSafe(baye.getToolName(p.Equip[0] - 1)));
+            if (p.Equip[1]) t.push((lv1 > 0 ? '+' + lv1 : '') + gbkSafe(baye.getToolName(p.Equip[1] - 1)));
+            if (t.length) eq.push(t.join(' ') + '(' + nameOf(list[j]) + ')');
         }
         out.push('闲置' + idle.length + ':' + briefList(idle, 4));
         out.push('已装' + eq.length + ':' + briefList(eq, 3));
@@ -4115,7 +4129,20 @@
        - 报名费是可选项，不报名 = 0 支出，但也没奖金。 */
 
     var RACE_SEASON = 0;        /* 赛季号（每 3 个月 +1） */
-    var RACE_HISTORY = [];      /* 历届冠军{season,name,king,date} */
+    /* 历届冠军：**持久化到 localStorage**（跟存档槽走）。
+       v1.22 修：原来是纯内存变量 → 刷新页面就没了（用户第 7 条：
+       「历届冠军数据和马匹状态要跟随存档保存和清除」）。 */
+    var RACE_HISTORY = loadRaceHistory();
+    function loadRaceHistory() {
+        try {
+            var raw = localStorage.getItem(skey('racehist_v1'));
+            if (raw) { var a2 = JSON.parse(raw); if (a2 && a2.length) return a2; }
+        } catch (e) { }
+        return [];
+    }
+    function saveRaceHistory() {
+        try { localStorage.setItem(skey('racehist_v1'), JSON.stringify(RACE_HISTORY || [])); } catch (e) { }
+    }
     var RACE_LAST_HELD = -1;    /* 上次举办的赛季号（给 api 诊断用） */
     var RACE_LAST_MD = -1;       /* 上次举办的月份号（1~12），同月绝不重复办 */
     var PENDING_RACE_SHOW = null;  /* 上月末存下的赛况，等下个月月初弹 */
@@ -4124,6 +4151,13 @@
     /* 赛季号只用于「距下届还有几个月」；
        **届数用 RACE_COUNT 独立计数**（v1.21 修：190年3月是第1届，
        但 raceSeason() = floor(3/3) = 1 → 标题写「第2届」，之后全错）。 */
+    /* 赛马间隔（月）：0 = 关闭，1~12 = 每 N 个月一届。存cfg，随档保存。 */
+    function raceInterval() {
+        var v = parseInt(cfg && cfg.raceEvery, 10);
+        if (isNaN(v) || v < 0) v = 3;
+        if (v > 12) v = 12;
+        return v;
+    }
     function raceSeason() { return Math.floor(gameMonthIndex() / 3); }
     function raceNo() { return RACE_COUNT + 1; }   /* 本届是第几届 */
     /* 月末专用赛季号：月末时引擎还没月结，用「下一个月」算，
@@ -4229,8 +4263,8 @@
     function mountState(king, nm) {
         var k = stKey(king, nm);
         if (!RACE_ST[k]) {
-            /* 初始状态 60~85（随机，看起来更自然） */
-            RACE_ST[k] = { s: 60 + rand(26), sick: Math.random() < 0.05 ? 1 : 0, feed: 0, win: 0, lose: 0, streak: 0 };
+            /* 初始状态 80（v1.22：原来 60~85 太低，新马一进场就吃亏） */
+            RACE_ST[k] = { s: 80, sick: Math.random() < 0.05 ? 1 : 0, feed: 0, win: 0, lose: 0, streak: 0 };
         }
         return RACE_ST[k];
     }
@@ -4278,9 +4312,8 @@
            v1.20.5 前是每势力独立 70% 概率 → 2 个势力时两人都弃权 = 无人参赛，
            于是月末该办赛却静默跳过（玩家看到「没显示」）。
            现在：先按 60% 逐个抽取，若一个都没中则强制让**跑得最快的那批**参加。 */
-        for (var i = 0; i < all.length; i++) {
-            if (Math.random() < 0.6) entries.push(all[i]);
-        }
+        /* 自动参赛：**全员出场**，不再随机弃权（用户要求「自动参加」） */
+        for (var i = 0; i < all.length; i++) entries.push(all[i]);
         if (!entries.length && all.length) {
             all.sort(function (a, b) {
                 var am = a.horses[0] ? a.horses[0].mv : 0, bm = b.horses[0] ? b.horses[0].mv : 0;
@@ -4295,8 +4328,9 @@
     function raceRunOne(season) {
         var myKing = (baye.data.g_PlayerKing || 0) + 1;
         var pool = raceMountPool();
+        /* v1.22：**取消报名制** —— 各势力的非在野马匹自动参赛（用户要求）。
+           报名费/手动报名全部作废。 */
         var entries = aiRaceEntry(pool, myKing);
-        if (RACE_ENTRY.length) entries.push({ king: myKing, horses: RACE_ENTRY.slice(), mine: true });
         if (!entries.length) return { lines: ['【赛马】本届无人参赛'], anim: [], rank: [], playerGot: 0 };
         var runners = [];
         entries.forEach(function (e) {
@@ -4309,9 +4343,10 @@
         });
         runners.sort(function (a, b) { return b.score - a.score; });
         runners.forEach(function (r, i) { r.rank = i + 1; });
-        /* ③ 赛况动画：3 段（v1.21 从 6 段压缩 —— 用户反馈「太多拖沓的界面」）
-           起跑+中段 / 最后冲刺 / 冲线。所有行 ≤14 汉字，避免引擎居中裁剪。 */
-        var anim = [], seg, q, order, mid, late, accident;
+        /* ③ 赛况动画（v1.22.0）：过程细化到 5 段 —— 起跑 / 中段 / 冲刺 / 冲线 / 全部排名
+           ★ 用户第 12 条：「过程太少、排名页太多」→ 过程扩到 5 段，
+             排名**一行一名连续列出**、奖金直接跟在名次后（不再单独开一页）。 */
+        var anim = [], seg, q, order, mid, late, accident, rankSeg;
         order = runners.slice().sort(function (x, y) { return y.score - x.score; });
         mid = order.slice().sort(function (x, y) {
             return y.score * (0.85 + Math.random() * 0.3) - x.score * (0.85 + Math.random() * 0.3);
@@ -4322,25 +4357,25 @@
         accident = null;
         for (q = 0; q < mid.length; q++) if (mid[q].ev) { accident = mid[q]; break; }
 
-        seg = '━━ 第' + raceNo() + ' 届 · 起跑 ━━\n'
+        seg = '━━ 起跑 ━━\n'
             + '都城赛场 ' + order.length + ' 匹马\n'
             + '发令枪响！\n'
-            + '起跑领先：' + order[0].nm;
-        if (accident) {
-            seg += '\n⚡ ' + accident.nm + '：' + accident.ev.txt;
-        } else {
-            seg += '\n中段 ' + mid[0].nm + ' 暂领先';
-        }
+            + '领先：' + order[0].nm
+            + (order[1] ? '、' + order[1].nm : '')
+            + (order[2] ? '、' + order[2].nm : '');
         anim.push(seg);
 
-        seg = '━━ 最后冲刺 ━━\n';
-        if (late[0].nm !== mid[0].nm) {
-            seg += '🔥 ' + late[0].nm + ' 强行超车！\n'
-                + '反超 ' + mid[0].nm;
-        } else {
-            seg += '格局未变，领先者守住';
-        }
-        seg += '\n' + late[0].nm + ' 咬牙冲线';
+        seg = '━━ 中段 ━━\n'
+            + (accident ? ('⚡ ' + accident.nm + '\n　' + accident.ev.txt) : '节奏稳健')
+            + '\n暂领先：' + mid[0].nm + '\n　状态 ' + mid[0].st.s;
+        anim.push(seg);
+
+        seg = '━━ 冲刺 ━━\n'
+            + (late[0].nm !== mid[0].nm
+                ? ('🔥 ' + late[0].nm + ' 反超 ' + mid[0].nm)
+                : '格局未变，领先者守住')
+            + '\n第 1：' + late[0].nm
+            + '\n第 2：' + (late[1] ? late[1].nm : '—');
         anim.push(seg);
 
         seg = '━━ 冲线 ━━\n'
@@ -4349,6 +4384,16 @@
             + '亚军：' + (runners[1] ? runners[1].nm : '—')
             + '\n季军：' + (runners[2] ? runners[2].nm : '—');
         anim.push(seg);
+
+        /* 全部排名：一行一名，奖金直接跟在名次后 */
+        rankSeg = ['━━ 全部排名 ━━'];
+        for (q = 0; q < runners.length; q++) {
+            var rq = runners[q];
+            rankSeg.push(pad('' + (q + 1), 3) + rq.nm + '　'
+                + racePrizeOf(q + 1) + '金'
+                + (rq.ev ? '　⚠' + rq.ev.txt : ''));
+        }
+        anim.push(rankSeg.join('\n'));
         /* 结果：列全排名 + 标注异常 */
         var lines = ['【赛马】第' + raceNo() + ' 届 · ' + runners.length + ' 匹马', ''];
         runners.forEach(function (r) {
@@ -4383,8 +4428,13 @@
             + Math.min(got, Math.max(0, 30000 - (Number(city.Money) || 0)));
         else got = 0;
         if (pri.length) { lines.push(''); lines.push('  你的奖金：'); pri.forEach(function (p) { lines.push('   ' + p); }); }
+        /* 收益汇总（用户第 12 条：最后总结本次收益明细 + 总收益，不显示冠军） */
         lines.push('');
-        lines.push('  本届冠军：' + champ.nm + '（' + kingName(champ.king) + '）');
+        lines.push('━━ 本次收益 ━━');
+        if (pri.length) { for (var qi = 0; qi < pri.length; qi++) lines.push('  ' + pri[qi]); }
+        else lines.push('  （本次无收益）');
+        lines.push('  ──────');
+        lines.push('  总收益 ' + got + ' 金');
         RACE_SEASON = season;
         RACE_LAST_HELD = season;
         /* ★ 先写历史再自增：raceNo() = RACE_COUNT + 1，
@@ -4393,6 +4443,7 @@
             date: monthKey().replace('-', '年') + '月' });
         RACE_COUNT++;
         if (RACE_HISTORY.length > 8) RACE_HISTORY.pop();
+        saveRaceHistory();
         try { saveRaceState(); } catch (e) { }
         return { lines: lines, anim: anim, rank: runners, playerGot: got };
     }
@@ -4424,30 +4475,60 @@
         });
     }
     /* ③ 串行播赛况：一次只显示一屏，点确认继续下一段 → 完整看完比赛过程 */
+    /* ★ 用 menu（大窗口）而不是 alert：alert 的框只有屏幕顶部一小块、
+       背景半透明（地图文字会透出来）、行宽约 14 汉字超出就换行错位。
+       menu 走 centerChoose(SW()-8, SH()-8)，有完整边框、自动折行、行高自适应。 */
     function playRaceAnim(anim, lines, onDone) {
-        /* ★ 用 menu（大窗口）而不是 alert（小弹窗）：
-             alert 的框只有屏幕上方一小块、背景半透明（地图文字会透出来）、
-             行宽约 14 个汉字，超出就换行错位（用户截图：文字叠成一片）。
-           menu 走 centerChoose(SW-8, SH-8)，有完整边框、自动折行、行高自适应。 */
+        /* 串行播放，每屏：
+           · **2 秒自动翻页**（末屏 5 秒，收益明细要看清）；按确认可立即跳过等待
+           · 末屏是**收益汇总**（用户第 12 条：不用再显示冠军）
+           · 倒计时显示在「继续」那一行上，让玩家知道会自动走 */
         var segs = anim.slice();
         if (lines && lines.length) {
-            segs.push('━━━━━━━━━━━ 全部排名 ━━━━━━━━━━━');
-            segs = segs.concat(lines);
+            segs = segs.concat([''], lines);
         }
         var i = 0;
         function next() {
-            if (i >= segs.length) { if (onDone) { try { onDone(); } catch (e) { } } return; }
+            if (i >= segs.length) {
+                if (onDone) { try { onDone(); } catch (e) { } }
+                return;
+            }
             var seg = segs[i++];
-            if (!seg) { next(); return; }
-            /* 只保留正文；进度提示单独一行（避免和正文混在一起） */
-            var body = seg.replace(/\n\n（下按继续[^\n]*）$/, '');
-            var items = body.split('\n');
+            if (!seg || !String(seg).length) { next(); return; }
+            var last = (i >= segs.length);
+            var items = String(seg).split('\n');
             items.push('');
-            items.push('─ 继续（' + i + '/' + segs.length + '）─');
+            items.push('─ 继续 ' + i + '/' + segs.length
+                + (last ? '（5秒）' : '（2秒）') + ' ─');
+            var done = false;
             menu(items, items.length - 1, function (ind) {
+                if (done) return;
+                done = true;
                 if (ind === baye.None || ind === 65535 || ind === undefined) { i = segs.length; }
                 next();
             });
+            /* 自动翻页：引擎 menu 是模态的，用 centerChoose 重复一次来模拟"自动按确认" */
+            if (last) {
+                setTimeout(function () {
+                    if (done) return;
+                    done = true;
+                    try {
+                        baye.centerChoose(SW() - 8, SH() - 8,
+                            fitMenuLines(items).lines, items.length - 1, function () { });
+                    } catch (e2) { }
+                    next();
+                }, 5000);
+            } else {
+                setTimeout(function () {
+                    if (done) return;
+                    done = true;
+                    try {
+                        baye.centerChoose(SW() - 8, SH() - 8,
+                            fitMenuLines(items).lines, items.length - 1, function () { });
+                    } catch (e3) { }
+                    next();
+                }, 2000);
+            }
         }
         next();
     }
@@ -4541,36 +4622,33 @@
     }
 
     /* 选拔赛入口：可选参赛马（默认全部），门票 = 参赛马数 × 1000 金 */
+    /* 御马校场：自己势力内部办赛，全部爱驹同场竞技（不再选马匹） */
     function raceSelectDialog() {
         var myKing = (baye.data.g_PlayerKing || 0) + 1;
-        var pool = raceMountPool().filter(function (m) { return m.king === myKing; });
-        if (pool.length < 2) { alert2('至少要有 2 匹马才能办选拔赛。\n（当前 ' + pool.length + ' 匹，去收集赤兔/的卢 等战马）'); return; }
+        var pool = myMounts();
+        if (pool.length < 2) {
+            menu(['至少要有 2 匹马才能办赛。', '', '当前 ' + pool.length + ' 匹', '', '─ 返回 ─'],
+                4, function () { stableDialog(); });
+            return;
+        }
         var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
-        var have = city ? (Number(city.Money) || 0) : 0;
-        var lines = ['【御马校场】爱驹同场竞技 · 收门票 · 每月一次',
-            '观众付门票 ' + SELECT_TICKET + ' 金', '（与马匹数量无关）', ''];
-        pool.forEach(function (m, i) {
-            var st = mountState(myKing, m.nm);
-            lines.push('  [' + i + '] ' + pad(m.nm, 8) + ' 移动+' + m.mv + '　状态 ' + st.s
-                + (st.sick ? '（病）' : ''));
-        });
+        var canRun = SELECT_LAST_MONTH !== gameMonthIndex();
+        var lines = ['━━ 御马校场 ━━', '', '爱驹同场竞技', '每月可办一次', '门票收入 ' + SELECT_TICKET + ' 金', ''];
+        for (var i = 0; i < pool.length; i++) {
+            var st = mountState(myKing, pool[i].nm);
+            lines.push('  ' + pad(pool[i].nm, 8) + ' 速' + pool[i].mv + '　状' + st.s + (st.sick ? '·病' : ''));
+        }
         lines.push('');
-        lines.push('  【全部出赛】（' + pool.length + ' 匹，门票 +' + (pool.length * SELECT_TICKET) + ' 金）');
-        lines.push('  【一键全选后开赛】');
-        menu(lines, 0, function (ind) {
+        lines.push(canRun ? '▶ 立即开赛' : '（本月已办过）');
+        lines.push('─ 返回 ─');
+        menu(lines, lines.length - 1, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) return;
-            if (ind < pool.length) {
-                /* 单匹报名 = 只跑这匹（不足 2 匹会提示） */
-                if (pool.length < 2) { alert2('不足 2 匹'); return; }
-                var res = raceSelectRun([ind]);
-                if (res) playRaceAnim(res.anim, res.lines, function () { stableDialog(); });
+            if (ind === lines.length - 2) {                      /* 立即开赛 */
+                var r = raceSelectRun(null);                     /* null = 全部出赛 */
+                if (r) playRaceAnim(r.anim, r.lines, function () { stableDialog(); });
                 return;
             }
-            /* 全部出赛 */
-            if (have >= pool.length * SELECT_TICKET || true) {
-                var r2 = raceSelectRun(null);
-                if (r2) playRaceAnim(r2.anim, r2.lines, function () { stableDialog(); });
-            }
+            stableDialog();
         });
     }
 
@@ -4584,56 +4662,108 @@
        排版铁律（v1.20.7 踩的坑）：每行 ≤14 汉字。引擎菜单窗口比 SW()-8 窄得多，
        超宽时它**不折行而是居中裁掉两侧** → 用户看到「换行后字往后退」。
      */
+    /* ================= 御马监（v1.22.0 重做）=================
+       用户要求：
+         · 打开时**默认不显示马匹**（马多了会把菜单顶出屏幕，看不到菜单项）
+         · 新增「马场」入口：进去看全部马匹 + 喂食提状态 / 治病
+         · 马匹行只显示「马名速度状态」，**不显示装备武将**（对赛马没用）
+         · 菜单精简合并（原 5 项 → 4 项，去掉已取消的「报名」）
+         · 状态初始值80（原来 60~85 偏低）
+       排版：每行 ≤12 汉字（MENU_MAX_HALF=24），否则引擎会居中裁剪两侧。
+     */
     function stableDialog() {
-        var myKing = (baye.data.g_PlayerKing || 0) + 1;
-        var persons = baye.data.g_Persons, rows = [], i, s, tid0, t, nm, mv;
-        for (i = 0; i < persons.length; i++) {
-            var p0 = persons[i];
-            if (!p0 || !p0.Level || p0.Level <= 0 || p0.Belong !== myKing) continue;
-            for (s = 0; s < 2; s++) {
-                if (!p0.Equip[s]) continue;
-                tid0 = p0.Equip[s] - 1;
-                t = baye.data.g_Tools[tid0];
-                if (!t) continue;
-                try { nm = gbkSafe(baye.getToolName(tid0)) || ''; } catch (e2) { nm = ''; }
-                if (!isMountName(nm)) continue;
-                mv = MOUNT_MV[nm] || (t.move || 1);
-                rows.push({ nm: nm, mv: mv, who: nameOf(i) });
-            }
-        }
-        rows.sort(function (x, y) { return y.mv - x.mv || (x.nm < y.nm ? -1 : 1); });
         var lines = ['━━ 御马监 ━━', ''];
-        if (!rows.length) {
-            lines.push('（还没有马匹可养）');
-            lines.push('赤兔 / 的卢 / 里飞沙等');
-            lines.push('共 29 匹战马可收集');
-        } else {
-            for (i = 0; i < rows.length; i++) {
-                var st0 = mountState(myKing, rows[i].nm);
-                var tag = st0.sick ? '·病' : (st0.streak >= 2 ? '·连胜' + st0.streak : '');
-                lines.push(pad(rows[i].nm, 7) + ' 速' + rows[i].mv
-                    + '状' + st0.s + tag + '　' + rows[i].who);
-            }
-        }
+        var my = myMounts().length;
+        lines.push(my ? ('现有爱驹 ' + my + ' 匹') : '（还没有马匹可养）');
         lines.push('');
-        /*★ 菜单项：用 MENU_ACTIONS 数组 + 起始下标做**0 基**索引映射。
-             之前的 bug：actBase = lines.length 之后 push 的第一项其索引就是 actBase，
-             但我判断时从 k === 1 开始 → 全部偏移 1（点「报名」没反应、
-             点「喂马」进报名、点「历届冠军」进校场）。
-             另：每项文字压到 ≤12 汉字（MENU_MAX_HALF=24），保证不被 fitMenuLines 折行。 */
         var actBase = lines.length;
-        var MENU_ACTIONS = ['① 报名赛马大会', '② 喂马（100粮草）', '③ 办御马校场',
-            '④ 历届冠军', '⑤ 赛马规则'];
+        var MENU_ACTIONS = ['① 马场（查看 / 喂马）', '② 御马校场', '③ 历届冠军', '④ 赛马规则'];
         for (var mi = 0; mi < MENU_ACTIONS.length; mi++) lines.push(MENU_ACTIONS[mi]);
         menu(lines, 0, function (ind) {
             if (ind === baye.None || ind === 65535 || ind === undefined) return;
-            var k = ind - actBase;                /* 0 基：k=0 就是「① 报名」 */
-            if (k === 0) { raceSignUpDialog(); return; }
-            if (k === 1) { feedStableDialog(); return; }
-            if (k === 2) { raceSelectDialog(); return; }
-            if (k === 3) { raceHistoryDialog(); return; }
-            if (k === 4) { raceRuleDialog(); return; }
+            var k = ind - actBase;                /* 0 基 */
+            if (k === 0) { stableFieldDialog(); return; }
+            if (k === 1) { raceSelectDialog(); return; }
+            if (k === 2) { raceHistoryDialog(); return; }
+            if (k === 3) { raceRuleDialog(); return; }
         });
+    }
+    /* ---------- ① 马场：查看全部马匹 + 喂食提状态 / 治病 ----------
+       点某匹马 → 立即喂食（花 100 粮草，状态 +6，可解除病态），喂完留在本页可继续喂别的。
+       点「返回」→ 回御马监。 */
+    function stableFieldDialog(msg) {
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var pool = myMounts();
+        if (!pool.length) {
+            menu(['（还没有马匹可养）', '', '赤兔 / 的卢 / 里飞沙等', '共 29 匹战马可收集', '', '─ 返回 ─'],
+                5, function () { stableDialog(); });
+            return;
+        }
+        var c = capitalCity(), city = c >= 0 ? cityAt(c) : null;
+        var food = city ? (Number(city.Food) || 0) : 0;
+        var lines = ['━━ 马场 ━━', '', '点马匹即可喂食', '100 粮草 → 状态 +6', '可解除病态', ''];
+        lines.push('都城粮草：' + food);
+        lines.push('');
+        var idxBase = lines.length;
+        for (var i = 0; i < pool.length; i++) {
+            var st = mountState(myKing, pool[i].nm);
+            var mark = st.sick ? '·病' : (st.s >= 100 ? '·满' : '');
+            lines.push('  ' + pad(pool[i].nm, 8) + ' 速' + pool[i].mv + '　状' + st.s + mark);
+        }
+        lines.push('');
+        lines.push('─ 返回 ─');
+        menu(lines, lines.length - 1, function (ind) {
+            if (ind === baye.None || ind === 65535 || ind === undefined) return;
+            if (ind >= idxBase && ind < idxBase + pool.length) {
+                var m = pool[ind - idxBase];
+                var cc = capitalCity(), cy = cc >= 0 ? cityAt(cc) : null;
+                if (!cy) { alert2('没有都城。'); return; }
+                if ((Number(cy.Food) || 0) < 100) { alert2('粮草不足（需要 100）'); return; }
+                var r = feedRaceMount(myKing, m.nm, 100);
+                if (!r.ok) { alert2(r.msg); return; }
+                cy.Food = (Number(cy.Food) || 0) - 100;
+                try { saveRaceState(); } catch (e) { }
+                stableFieldDialog(r.msg);       /* 留在本页，可继续喂下一匹 */
+                return;
+            }
+            stableDialog();
+        });
+    }
+    /* 历届冠军：独立菜单，每届两行 */
+    function raceHistoryDialog() {
+        if (!RACE_HISTORY.length) {
+            menu(['还没有办过赛马大会。', '', '赛马每 ' + raceInterval() + ' 个月一届。', '', '─ 返回 ─'],
+                4, function () { stableDialog(); });
+            return;
+        }
+        var items = ['━━ 历届冠军 ━━', ''];
+        for (var i = 0; i < RACE_HISTORY.length; i++) {
+            var h = RACE_HISTORY[i];
+            items.push('第' + h.no + ' 届　' + h.name);
+            items.push('　' + kingName(h.king) + '　' + h.date);
+        }
+        items.push('');
+        items.push('─ 返回 ─');
+        menu(items, items.length - 1, function () { stableDialog(); });
+    }
+    /* 赛马规则：★ 光标默认停在**顶部**（v1.22 修：原来 init=30 落在底部） */
+    function raceRuleDialog() {
+        var iv = raceInterval();
+        var r = [
+            '━━ 赛马规则 ━━', '',
+            '每 ' + iv + ' 个月一届',
+            '各势力自动出马', '无需报名', '',
+            '胜负 = 移动力 + 状态', '状态靠喂马提升', '',
+            '意外：失前蹄/坠马', '　　　/受惊/掉速', '',
+            '奖金（名次 · 金）：'
+        ];
+        for (var i = 0; i < RACE_PRIZE.length; i++) {
+            r.push('　第' + (i + 1) + ' 名 ' + RACE_PRIZE[i]);
+        }
+        r.push('　11 名以后 ' + RACE_PRIZE_MIN);
+        r.push('');
+        r.push('─ 返回 ─');
+        menu(r, 0, function () { stableDialog(); });
     }
     /* 历届冠军：独立菜单，每届两行（马名 / 君主+日期） */
     function raceHistoryDialog() {
@@ -4717,11 +4847,17 @@
                 sidx.push(s2);
             }
             if (!slots.length) {
-                menu([nameOf(pid) + ' 身上没有可强化的装备。', '（消耗品/无属性道具不参与强化）']);
+                menu([nameOf(pid) + ' 身上没有可强化的装备。', '（消耗品/无属性道具不参与强化）', '', '─ 返回 ─'],
+                    3, function () { forgeDialog(); });
                 return;
             }
-            menu(slots, 0, function (ind2) {
-                if (ind2 === baye.None || ind2 === 65535 || ind2 === undefined) return;
+            /* v1.22：加「返回」行（第 10 条：次级界面要能回上级），
+               取消时回铁匠铺武将列表而不是直接关闭界面（第 3 条）。 */
+            slots.push('');
+            slots.push('─ 返回 ─');
+            menu(slots, slots.length - 1, function (ind2) {
+                if (ind2 === baye.None || ind2 === 65535 || ind2 === undefined) { forgeDialog(); return; }
+                if (ind2 >= sidx.length) { forgeDialog(); return; }   /* 点了「返回」 */
                 forgeTry(pid, sidx[ind2]);
             });
         });
@@ -5104,7 +5240,7 @@
         var c = capitalCity();
         if (c < 0) { if (!silent) alert2('没有己方城池，无法增加粮草'); return 0; }
         var want = Math.max(0, Math.round(safeWeight('richAmount', 3000)));
-        if (!want) { if (!silent) alert2('加粮数量为 0（可在金手指面板里改「暴富金额」）'); return 0; }
+        if (!want) { if (!silent) alert2('加粮数量为 0（可在星助手面板里改「暴富金额」）'); return 0; }
         var myKing = (baye.data.g_PlayerKing || 0) + 1;
         var order = [c], i, list = ownCities(myKing);
         for (i = 0; i < list.length; i++) if (list[i] !== c) order.push(list[i]);
@@ -5131,7 +5267,7 @@
         var c = capitalCity();
         if (c < 0) { if (!silent) alert2('没有己方城池，无法增加金钱'); return 0; }
         var want = Math.max(0, Math.round(safeWeight('richAmount', 3000)));
-        if (!want) { if (!silent) alert2('暴富金额为 0，未发放（可在金手指面板里改）'); return 0; }
+        if (!want) { if (!silent) alert2('暴富金额为 0，未发放（可在星助手面板里改）'); return 0; }
         var myKing = (baye.data.g_PlayerKing || 0) + 1;
         var order = [c], i, list = ownCities(myKing);
         for (i = 0; i < list.length; i++) if (list[i] !== c) order.push(list[i]);
@@ -5379,7 +5515,8 @@
         { k: 'noResCap', t: '资源防截断', d: '默认开启。引擎每月结算会把金币削到 30000；本项只在检测到「被削到 30000」时补回原额度（你自己花掉的钱不会补）。粮草被引擎溢出归零时也会补回' },
         { k: 'forge', t: '铁匠铺（装备强化）', d: 'DNF 式强化：花钱提升装备等级（等级不设上限），等级越高越贵、成功率越低、失败掉 1 级。强化只加伤害系数，不改引擎的武力/智力面板数值，列表里以「+N」标注' },
         { k: 'forgePity', t: '强化保底', d: '默认开启。连续失败 8 次后下一次必定成功，避免高等级陷入无限掉级（+20 以上成功率仅 4%）' },
-        { k: 'raceOn', t: '赛马大会（每 3 个月）', d: '默认开启。每 3 个月（3/6/9/12 月）月末在都城自动举办，按坐骑移动力排名发奖金（第1名 1500 金，逐级递减到 200 金），奖金直接进都城金币用于强化。可随时去【御马监】报名或手动举办；御马监里还能「喂马」提升马匹状态（花 100 粮草，状态 +6，可治病）' },
+        { k: 'raceOn', t: '赛马大会', d: '默认开启。各势力非在野马匹自动参赛（同月内没被搜索到的马不参加），无需报名。奖金前十六名见【赛马规则】' },
+        { k: 'raceEvery', t: '赛马间隔（月）', d: '每隔几个月办一届赛马大会。0 = 关闭，1 = 每月都办，12 = 每年一届。默认 3。' },
         { k: 'aiForge', t: 'AI 势力也会强化', d: '默认开启。每个 AI 势力用自己的城池收入强化自己的武将（花钱按玩家的 34% 计价、成功率低 8 个百分点、最高等级=城池数+6）。这样玩家 +20 时 AI 也在成长，不会单方面碾压；同时 AI 变强会消耗它的经济 → 出征变慢' },
         { k: 'levelBoost', t: '武将等级提升', d: '每月给全部己方武将 +30 经验（引擎经验条满 100 即升 1 级，等级上限由引擎 maxLevel 决定，默认 30）' },
         { k: 'forgeGuarantee', t: '强化必定成功', d: '默认关。开启后强化成功率强制 100%（费用照收），配合铁匠铺快速刷高等级用' },
@@ -5398,7 +5535,7 @@
 
         var wrap = document.createElement('div');
         wrap.id = 'bayeCheatDock';
-        var html = '<button class="bd" id="bayeCheatBtn" title="金手指设置（可拖动）">⚙</button><div class="panel">';
+        var html = '<button class="bd" id="bayeCheatBtn" title="星助手设置（可拖动）">⚙</button><div class="panel">';
         html += '<h4>功能开关</h4>';
         UI_ROWS.forEach(function (r) {
             html += '<div class="row"><div><div class="t">' + r.t + '</div><div class="d">' + r.d + '</div></div>'
@@ -5471,7 +5608,7 @@
             + '<div class="tip" style="text-align:left">资源上限由引擎控制：金币月结被夹在 30000，粮草超过 65536 会绕回 0；开启「解除金币/粮草上限」后，金币可跨月结转累积到 65535，粮草每月补到 65535。</div>';
         html += '<h4>其他</h4><div class="fn">'
             + '<button data-fn="reset">恢复默认设置</button>'
-            + '</div><div class="tip">月报 / 势力分布 / 排行 / 图鉴 / 跟踪都在游戏内：按 H（或触屏「帮助」）打开金手指菜单。图标可拖动，点面板外任意处收起。</div>';
+            + '</div><div class="tip">月报 / 势力分布 / 排行 / 图鉴 / 跟踪都在游戏内：按 H（或触屏「帮助」）打开星助手菜单。图标可拖动，点面板外任意处收起。</div>';
         html += '</div>';
         wrap.innerHTML = html;
         document.body.appendChild(wrap);

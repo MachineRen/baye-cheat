@@ -1,4 +1,4 @@
-# 三国霸业 · 金手指（baye.bbkgames.com 版）
+# 三国霸业 · 星助手（Star Assistant）
 
 浏览器辅助工具页，适用于 **https://baye.bbkgames.com/index.html**（平衡版2.1三国战纪 / 平衡版2.1修罗模式）。
 

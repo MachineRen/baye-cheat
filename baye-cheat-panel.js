@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.22.2';
+    var CHEAT_VERSION = '1.23.0-probe';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -2975,7 +2975,7 @@
 
     function onShowMainHelp() {
         var items = ['查看月报', '势力分布', '装备分布', '武力排行', '智力排行',
-            '宝物图鉴', '武将跟踪', '武将修复', '铁匠铺', '御马监', '资源管理', '显示版本'];
+            '宝物图鉴', '武将跟踪', '武将修复', '铁匠铺', '御马监', '资源管理', '显示版本', '彩色探测'];
         var hasOrigin = !!wrappedHooks.showMainHelp;
         if (hasOrigin) items.push('原版帮助');
         /* 主菜单用小窗（56x66），和霸哥版手感一致 —— 别占满屏 */
@@ -2994,7 +2994,8 @@
                 else if (ind === 9) stableDialog();
                 else if (ind === 10) showResourceMenu();
                 else if (ind === 11) showVersion();
-                else if (ind === 12 && hasOrigin) wrappedHooks.showMainHelp.apply(baye.hooks, [undefined]);
+                else if (ind === 12) colorProbe();
+                else if (ind === 13 && hasOrigin) wrappedHooks.showMainHelp.apply(baye.hooks, [undefined]);
             } catch (e) {
                 log('菜单项异常', e);
                 alert2('执行出错：' + e.message);
@@ -3185,6 +3186,55 @@
             }, 700);
             return true;
         } catch (e4) { return false; }
+    }
+
+    /* ---------- 彩色能力探测（v1.23.0，临时工具）----------
+       已知：① 引擎菜单里有「黑白 / 彩色」切换（引擎自带，说明底层支持）
+             ② baye.drawText(x, y, text, mode) 的第4 参在引擎脚本里恒为 1
+             ③ baye.setFont 存在但源码无调用示例
+       待测：setFont 的签名、centerChoose 项能否带颜色、data 里有没有颜色字段。 */
+    function colorProbe() {
+        var out = [], i;
+        function p2() { out.push([].slice.call(arguments).join(' ')); }
+        p2('=== drawText 第4参数（着色模式）===');
+        for (i = 0; i <= 20; i++) {
+            try { baye.drawText(2, 2, 'T' + i, i); p2('  mode=' + i + ' OK'); }
+            catch (e) { p2('  mode=' + i + ' 报错'); }
+        }
+        p2('=== baye.setFont===');
+        p2('  typeof=' + typeof baye.setFont);
+        if (typeof baye.setFont === 'function') {
+            p2('  参数个数=' + baye.setFont.length);
+            var tries = [
+                ['#ff0000', function () { return baye.setFont('#ff0000'); }],
+                ['255,0,0', function () { return baye.setFont('255,0,0'); }],
+                ['3数字', function () { return baye.setFont(255, 0, 0); }],
+                ['1数字', function () { return baye.setFont(1); }],
+                ['对象', function () { return baye.setFont({ color: '#f00' }); }]
+            ];
+            for (i = 0; i < tries.length; i++) {
+                try {
+                    var r = tries[i][1]();
+                    p2('  ' + tries[i][0] + ' → OK 返回=' + JSON.stringify(r));
+                } catch (e) { p2('  ' + tries[i][0] + ' → 报错'); }
+            }
+        }
+        p2('=== baye.data 颜色字段 ===');
+        try {
+            var ks = Object.keys(baye.data).filter(function (k) {
+                return /col|rgb|theme|paint/i.test(k);
+            });
+            p2('  ' + (ks.length ? ks.join(', ') : '（无）'));
+        } catch (e) { p2('  读取失败'); }
+        p2('=== 中心框尺寸 ===');
+        p2('  g_screenWidth=' + baye.data.g_screenWidth + ' g_screenHeight=' + baye.data.g_screenHeight);
+        try { p2('  探测 drawText 长度: ' + baye.drawText.length); } catch (e) { }
+        log('彩色探测:\n' + out.join('\n'));
+        menu(['彩色探测结果（详见控制台）', ''].concat(
+            out.filter(function (x) { return x.indexOf('===') >= 0 || x.indexOf('typeof') >= 0
+                || x.indexOf('参数个数') >= 0 || x.indexOf('g_screen') >= 0
+                || x.indexOf('颜色字段') >= 0 || x.indexOf('OK 返回') >= 0; })
+        ).concat(['', '─ 返回 ─']), 24, function () { versionDialog(); });
     }
 
     /* ---------- 势力君主名（v1.20.5 定稿）----------

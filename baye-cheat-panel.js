@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.23.0';
+    var CHEAT_VERSION = '1.23.1';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -2975,7 +2975,7 @@
 
     function onShowMainHelp() {
         var items = ['查看月报', '势力分布', '装备分布', '武力排行', '智力排行',
-            '宝物图鉴', '武将跟踪', '武将修复', '铁匠铺', '御马监', '资源管理', '显示版本', '强化配色'];
+            '宝物图鉴', '武将跟踪', '武将修复', '铁匠铺', '御马监', '资源管理', '显示版本'];
         var hasOrigin = !!wrappedHooks.showMainHelp;
         if (hasOrigin) items.push('原版帮助');
         /* 主菜单用小窗（56x66），和霸哥版手感一致 —— 别占满屏 */
@@ -2994,7 +2994,6 @@
                 else if (ind === 9) stableDialog();
                 else if (ind === 10) showResourceMenu();
                 else if (ind === 11) showVersion();
-                else if (ind === 12) forgeColorHelp();
                 else if (ind === 13 && hasOrigin) wrappedHooks.showMainHelp.apply(baye.hooks, [undefined]);
             } catch (e) {
                 log('菜单项异常', e);
@@ -3054,23 +3053,12 @@
             var lines = kind === 'power' ? cityPowerLines(index, innerHalf) : cityToolLines(index);
             var y = pad2, k, j;
             for (k = 0; k < lines.length && y < h - 6; k++) {
-                var raw = lines[k];
-                /* ★ v1.23.0：__C__<档位> 前缀 = 按强化等级着色。
-                   探测实测：baye.setFont(n) 的 n 只有 0~5 有效（>5 回落0），
-                   而 centerChoose 菜单**无法逐项染色** → 只有这个自绘区能做彩色。 */
-                var tier = 0;
-                if (raw.indexOf('__C__') === 0) {
-                    tier = parseInt(raw.charAt(3), 10) || 0;
-                    raw = raw.slice(4);
-                }
-                try { baye.setFont(tier); } catch (e10) { }
-                var wrapped = wrapLines(raw, innerHalf);
+                var wrapped = wrapLines(lines[k], innerHalf);
                 for (j = 0; j < wrapped.length && y < h - 6; j++) {
                     drawText2(pad2, y, wrapped[j]);
                     y += lineH;
                 }
             }
-            try { baye.setFont(0); } catch (e11) { }   /* 渲染完恢复默认色 */
         }
 
         /* willChangeMenuSelection 是全局单例，必须在 willCloseMenu 里清掉 */
@@ -3206,50 +3194,6 @@
        待测：setFont 的签名、centerChoose 项能否带颜色、data 里有没有颜色字段。 */
 
     /* ---------- 强化等级配色（DNF 风格，v1.23.0）----------
-       ★ 探测结论（用户实测 v1.23.0-probe2）：
-         · baye.setFont(n) 的 n **只有 0~5 有效**，>5 全部回落到 0
-           （控制台逐行打印「set cn font to 0..5」）
-         · 引擎有「黑白 / 彩色」两种模式，**必须切到彩色**才能看到颜色
-       所以 6 档正好用来做强化分级（参考 DNF：等级越高越炫）。
-       ⚠ 引擎的 0~5 实际对应哪 6 个颜色取决于它自己的调色板，
-         下面按「白 → 绿 → 蓝 → 紫 → 橙金 → 粉」的顺序映射；
-         如果真机显示的颜色和这个不符，改这一张表即可。 */
-    var FORGE_COLOR_TIER = [
-        /* 0 */ '白', /* 1 */ '绿', /* 2 */ '蓝',
-        /* 3 */ '紫', /* 4 */ '橙金', /* 5 */ '粉'
-    ];
-    /* 强化等级 → 颜色索引（0~5）。超过 15 用最高档。 */
-    function forgeColorTier(lv) {
-        lv = Number(lv) || 0;
-        if (lv <= 0) return 0;                /* 未强化：默认色 */
-        if (lv <= 3) return 0;                /* +1~+3 白 */
-        if (lv <= 6) return 1;                /* +4~+6 绿 */
-        if (lv <= 9) return 2;                /* +7~+9 蓝 */
-        if (lv <= 11) return 3;               /* +10~+11 紫 */
-        if (lv <= 13) return 4;               /* +12~+13 橙金（+13 亮光见下）*/
-        return 5;                             /* +14+ 粉 */
-    }
-    /* 是不是「亮光」级（+13 起）：用符号强调，弥补引擎只有静态颜色的不足 */
-    function forgeIsGlow(lv) { return (Number(lv) || 0) >= 13; }
-    function forgeColorName(lv) { return FORGE_COLOR_TIER[forgeColorTier(lv)]; }
-
-    /* 强化等级说明页（替代探测菜单） */
-    function forgeColorHelp() {
-        menu([
-            '━━ 强化配色说明 ━━', '',
-            '强化等级越高，颜色越炫', '',
-            '+1~+3　白（默认）',
-            '+4~+6　' + FORGE_COLOR_TIER[1],
-            '+7~+9　' + FORGE_COLOR_TIER[2],
-            '+10~+11　' + FORGE_COLOR_TIER[3],
-            '+12　　' + FORGE_COLOR_TIER[4],
-            '+13　　' + FORGE_COLOR_TIER[4] + ' ✦亮光',
-            '+14~+15　' + FORGE_COLOR_TIER[5], '',
-            '⚠ 需在引擎菜单切到「彩色」',
-            '　（黑白模式下不显示颜色）', '',
-            '─ 返回 ─'
-        ], 0, function () { onShowMainHelp(); }, function () { forgeColorHelp(); });
-    }
 
     /* ---------- 势力君主名（v1.20.5 定稿）----------
        ★ 直接用 safeName(势力编号) —— 引擎的 getPersonNameByID 对「势力编号」

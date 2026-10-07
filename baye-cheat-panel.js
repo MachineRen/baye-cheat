@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.22.1';
+    var CHEAT_VERSION = '1.22.2';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -3031,9 +3031,11 @@
         var names = [], i;
         for (i = 0; i < cities.length; i++) names.push(cityName(i));
 
-        /* 右侧列表宽（像素）：v1.22 由 24 收窄到 18 —— 之前 24 把详情区挤到只剩半屏，
-           用户看到「已装4：+1（田豫）…后面还剩挺多空间就换行」。*/
-        var listW = 18;
+        /* 右侧列表宽（像素）。
+           ★ v1.22.1 改回 24：v1.22.0 收到 18 后只剩 1.5 个汉字，
+             城名「北平」被引擎裁成「北」（用户实测：v1.21.1 正常、v1.22.0 起异常）。
+           24 = 恰好 2 个全角汉字，城名完整显示。 */
+        var listW = 24;
         var listX = SW() - listW - 2;
         var pad2 = 3;
         /* LCD 字库半角 6px、全角 12px：详情区每行可容纳的半角数 = 可用像素 / 6
@@ -4183,31 +4185,76 @@
          君主= 该势力真正的君主（见 kingPidOfCity）
        玩家能搜到的马 = 已在某个武将身上；搜不到的（还在野）不参赛，
        符合「系统在野未搜出的马匹不能参加」的要求。 */
-    function raceMountPool() {
-        var pool = [], myKing = (baye.data.g_PlayerKing || 0) + 1;
-        var persons = baye.data.g_Persons, cities = baye.data.g_Cities;
-        var i, s2, tid0, t, nm, p, c, owner;
+    /* ---------- 马匹名册（v1.22.1）----------
+       用户实测：「参赛马匹数量肯定有问题，武将没有阵亡，即使被俘总数量也不应该减少」。
+       根因：原来扫的是「武将当前装备槽」，武将被俘/战败时引擎会卸/转移装备 → 扫不到。
+       改法：**首次见到就登记进名册，之后永久参赛**，与装备槽彻底解耦。
+       只增不减 —— 搜到新马就多一匹，符合「逐渐增多」的预期。 */
+    var RACE_ROSTER_KEY = 'baye_cheat_raceroster_v1';
+    var RACE_ROSTER = null;
+    function loadRoster() {
+        if (RACE_ROSTER) return RACE_ROSTER;
+        RACE_ROSTER = {};
+        try {
+            var raw = localStorage.getItem(skey('raceroster_v1'));
+            if (raw) RACE_ROSTER = JSON.parse(raw) || {};
+        } catch (e) { RACE_ROSTER = {}; }
+        return RACE_ROSTER;
+    }
+    function saveRoster() {
+        try { localStorage.setItem(skey('raceroster_v1'), JSON.stringify(RACE_ROSTER || {})); } catch (e) { }
+    }
+    /* 把「武将身上现有的坐骑」并入名册；返回名册（势力→ 马名数组） */
+    function raceRoster() {
+        var ros = loadRoster();
+        var persons = baye.data.g_Persons, i, s2, tid0, t, nm, changed = false;
         for (i = 0; i < persons.length; i++) {
-            p = persons[i];
-            if (!p || !p.Level || p.Level <= 0) continue;
-            /* 排除在野与俘虏：只有已归属某势力的马才参赛 */
-            if (p.Belong <= 0 || p.Belong === WILD || p.Belong === CAPTIVE) continue;
+            var q = persons[i];
+            if (!q || !q.Level || q.Level <= 0) continue;
+            if (q.Belong <= 0 || q.Belong === WILD || q.Belong === CAPTIVE) continue;  /* 在野/俘虏不登记 */
             for (s2 = 0; s2 < 2; s2++) {
-                if (!p.Equip || !p.Equip[s2]) continue;
-                tid0 = p.Equip[s2] - 1;
+                if (!q.Equip || !q.Equip[s2]) continue;
+                tid0 = q.Equip[s2] - 1;
                 t = baye.data.g_Tools[tid0];
                 if (!t) continue;
                 try { nm = gbkSafe(baye.getToolName(tid0)) || ''; } catch (e) { nm = ''; }
                 if (!isMountName(nm)) continue;
-                c = cityOfPerson(i);                   /* 该武将驻扎的城 */
-                owner = (c >= 0 && cities[c]) ? cities[c].Belong : p.Belong;
+                var k2 = String(q.Belong);
+                if (!ros[k2]) { ros[k2] = []; changed = true; }
+                if (ros[k2].indexOf(nm) < 0) { ros[k2].push(nm); changed = true; }   /* 只增不减 */
+            }
+        }
+        if (changed) saveRoster();
+        return ros;
+    }
+    /* 玩家名下的马（御马苑用）—— 也走名册，保证和赛马一致 */
+    function myMounts() {
+        var ros = raceRoster();
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var list = ros[String(myKing)] || [];
+        var out = [], i, mv;
+        for (i = 0; i < list.length; i++) {
+            mv = MOUNT_MV[list[i]] || 1;
+            out.push({ nm: list[i], mv: mv, king: myKing });
+        }
+        return out;
+    }
+
+    function raceMountPool() {
+        /* v1.22.1：读**名册**（不再直接扫装备槽）—— 武将被俘/卸装备不影响参赛 */
+        var ros = raceRoster();
+        var myKing = (baye.data.g_PlayerKing || 0) + 1;
+        var pool = [], k, list, i, cities = baye.data.g_Cities;
+        for (k in ros) {
+            if (!ros.hasOwnProperty(k)) continue;
+            if (Number(k) <= 0 || Number(k) === WILD || Number(k) === CAPTIVE) continue;
+            list = ros[k] || [];
+            for (i = 0; i < list.length; i++) {
                 pool.push({
-                    nm: nm, mv: MOUNT_MV[nm] || (t.move || 1),
-                    king: p.Belong,                      /* 马的真正归属：武将所属势力 */
-                    city: c,                             /* 所在城池（用于显示） */
-                    rider: nameOf(i),                     /* 骑手 */
-                    kingName: kingName(p.Belong),        /* 君主（按城池/势力反查） */
-                    mine: p.Belong === myKing
+                    nm: list[i], mv: MOUNT_MV[list[i]] || 1,
+                    king: Number(k),
+                    kingName: kingName(Number(k)),
+                    rider: '', mine: Number(k) === myKing
                 });
             }
         }
@@ -4643,7 +4690,7 @@
             if (k === 1) { raceSelectDialog(); return; }
             if (k === 2) { raceHistoryDialog(); return; }
             if (k === 3) { raceRuleDialog(); return; }
-        }, function () { stableDialog(); });
+        });   /* v1.22.1：顶级界面**不加 reopen** —— 之前加了导致按返回又重开，永远退不出（用户第 4 条） */
     }
     /* ---------- ① 马场：查看全部马匹 + 喂食提状态 / 治病 ----------
        点某匹马 → 立即喂食（花 100 粮草，状态 +6，可解除病态），喂完留在本页可继续喂别的。
@@ -4703,7 +4750,8 @@
         }
         items.push('');
         items.push('─ 返回 ─');
-        menu(items, items.length - 1, function () { stableDialog(); });
+        menu(items, items.length - 1, function () { stableDialog(); },
+            function () { raceHistoryDialog(); });
     }
     /* 赛马规则：★ 光标默认停在**顶部**（v1.22 修：原来 init=30 落在底部） */
     function raceRuleDialog() {
@@ -4712,23 +4760,23 @@
             '━━ 赛马规则 ━━', '',
             '每 ' + iv + ' 个月一届',
             '各势力自动出马', '无需报名', '',
-            '胜负 = 移动力 + 状态', '状态靠喂马提升', '',
-            '意外：失前蹄/坠马', '　　　/受惊/掉速', '',
-            '奖金（名次 · 金）：'
+            '胜负 = 移动力 + 状态',
+            '状态靠御马苑喂马提升', '',
+            '意外：失前蹄/ 坠马', '　　　/ 受惊 / 掉速', '',
+            '奖金：冠军 ' + RACE_PRIZE[0],
+            '　2~6 名 ' + RACE_PRIZE[1] + '～' + RACE_PRIZE[5],
+            '　7~10 名 ' + RACE_PRIZE[6] + '～' + RACE_PRIZE[9],
+            '　11 名以后保底 ' + RACE_PRIZE_MIN, '',
+            '─ 返回 ─'
         ];
-        for (var i = 0; i < RACE_PRIZE.length; i++) {
-            r.push('　第' + (i + 1) + ' 名 ' + RACE_PRIZE[i]);
-        }
-        r.push('　11 名以后 ' + RACE_PRIZE_MIN);
-        r.push('');
-        r.push('─ 返回 ─');
         menu(r, 0, function () { stableDialog(); }, function () { raceRuleDialog(); });
     }
     /* 历届冠军：独立菜单，每届两行（马名 / 君主+日期） */
     function raceHistoryDialog() {
         if (!RACE_HISTORY.length) {
-            menu(['还没有办过赛马大会。', '', '赛马在 3/6/9/12 月月末举办。'], 0,
-                function () { stableDialog(); });
+            var iv0 = raceInterval();
+            menu(['还没有办过赛马大会。', '', iv0 > 0 ? ('每 ' + iv0 + ' 个月末举办。') : '赛马已关闭。'], 0,
+                function () { stableDialog(); }, function () { raceHistoryDialog(); });
             return;
         }
         var items = ['━━ 历届冠军 ━━', ''];

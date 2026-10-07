@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.23.0-probe2';
+    var CHEAT_VERSION = '1.23.0';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -2975,7 +2975,7 @@
 
     function onShowMainHelp() {
         var items = ['查看月报', '势力分布', '装备分布', '武力排行', '智力排行',
-            '宝物图鉴', '武将跟踪', '武将修复', '铁匠铺', '御马监', '资源管理', '显示版本', '彩色探测'];
+            '宝物图鉴', '武将跟踪', '武将修复', '铁匠铺', '御马监', '资源管理', '显示版本', '强化配色'];
         var hasOrigin = !!wrappedHooks.showMainHelp;
         if (hasOrigin) items.push('原版帮助');
         /* 主菜单用小窗（56x66），和霸哥版手感一致 —— 别占满屏 */
@@ -2994,7 +2994,7 @@
                 else if (ind === 9) stableDialog();
                 else if (ind === 10) showResourceMenu();
                 else if (ind === 11) showVersion();
-                else if (ind === 12) colorProbe();
+                else if (ind === 12) forgeColorHelp();
                 else if (ind === 13 && hasOrigin) wrappedHooks.showMainHelp.apply(baye.hooks, [undefined]);
             } catch (e) {
                 log('菜单项异常', e);
@@ -3054,12 +3054,23 @@
             var lines = kind === 'power' ? cityPowerLines(index, innerHalf) : cityToolLines(index);
             var y = pad2, k, j;
             for (k = 0; k < lines.length && y < h - 6; k++) {
-                var wrapped = wrapLines(lines[k], innerHalf);
+                var raw = lines[k];
+                /* ★ v1.23.0：__C__<档位> 前缀 = 按强化等级着色。
+                   探测实测：baye.setFont(n) 的 n 只有 0~5 有效（>5 回落0），
+                   而 centerChoose 菜单**无法逐项染色** → 只有这个自绘区能做彩色。 */
+                var tier = 0;
+                if (raw.indexOf('__C__') === 0) {
+                    tier = parseInt(raw.charAt(3), 10) || 0;
+                    raw = raw.slice(4);
+                }
+                try { baye.setFont(tier); } catch (e10) { }
+                var wrapped = wrapLines(raw, innerHalf);
                 for (j = 0; j < wrapped.length && y < h - 6; j++) {
                     drawText2(pad2, y, wrapped[j]);
                     y += lineH;
                 }
             }
+            try { baye.setFont(0); } catch (e11) { }   /* 渲染完恢复默认色 */
         }
 
         /* willChangeMenuSelection 是全局单例，必须在 willCloseMenu 里清掉 */
@@ -3193,89 +3204,51 @@
              ② baye.drawText(x, y, text, mode) 的第4 参在引擎脚本里恒为 1
              ③ baye.setFont 存在但源码无调用示例
        待测：setFont 的签名、centerChoose 项能否带颜色、data 里有没有颜色字段。 */
-    function colorProbe() {
-        /* ---------- 彩色可视化探测 v2（v1.23.0-probe2）----------
-           v1 已确认：baye.setFont(n) = 设置字体颜色索引（控制台会打「set cn ... font to N」）。
-           这轮直接**画出来**，用眼睛确认：
-             ① 索引 0~15 哪些真的有颜色
-             ② 菜单（centerChoose）文字能不能被 setFont 染色 */
-        var i, x, y, W = SW(), H = SH();
-        baye.clearRect(0, 0, W, H);
-        baye.drawRect(0, 0, W, H);
-        baye.drawRect(2, 2, W - 3, H - 3);
 
-        /* 标题（不染色） */
-        baye.setFont(0);
-        baye.drawText(6, 6, '彩色探测 v2', 1);
-        baye.drawText(6, 18, 'setFont(n) = 颜色索引 n', 1);
+    /* ---------- 强化等级配色（DNF 风格，v1.23.0）----------
+       ★ 探测结论（用户实测 v1.23.0-probe2）：
+         · baye.setFont(n) 的 n **只有 0~5 有效**，>5 全部回落到 0
+           （控制台逐行打印「set cn font to 0..5」）
+         · 引擎有「黑白 / 彩色」两种模式，**必须切到彩色**才能看到颜色
+       所以 6 档正好用来做强化分级（参考 DNF：等级越高越炫）。
+       ⚠ 引擎的 0~5 实际对应哪 6 个颜色取决于它自己的调色板，
+         下面按「白 → 绿 → 蓝 → 紫 → 橙金 → 粉」的顺序映射；
+         如果真机显示的颜色和这个不符，改这一张表即可。 */
+    var FORGE_COLOR_TIER = [
+        /* 0 */ '白', /* 1 */ '绿', /* 2 */ '蓝',
+        /* 3 */ '紫', /* 4 */ '橙金', /* 5 */ '粉'
+    ];
+    /* 强化等级 → 颜色索引（0~5）。超过 15 用最高档。 */
+    function forgeColorTier(lv) {
+        lv = Number(lv) || 0;
+        if (lv <= 0) return 0;                /* 未强化：默认色 */
+        if (lv <= 3) return 0;                /* +1~+3 白 */
+        if (lv <= 6) return 1;                /* +4~+6 绿 */
+        if (lv <= 9) return 2;                /* +7~+9 蓝 */
+        if (lv <= 11) return 3;               /* +10~+11 紫 */
+        if (lv <= 13) return 4;               /* +12~+13 橙金（+13 亮光见下）*/
+        return 5;                             /* +14+ 粉 */
+    }
+    /* 是不是「亮光」级（+13 起）：用符号强调，弥补引擎只有静态颜色的不足 */
+    function forgeIsGlow(lv) { return (Number(lv) || 0) >= 13; }
+    function forgeColorName(lv) { return FORGE_COLOR_TIER[forgeColorTier(lv)]; }
 
-        /* ── 第一行：0~15 每个索引各画一个数字 ── */
-        y = 34;
-        baye.drawText(6, y - 2, '索引:', 1);
-        for (i = 0; i <= 15; i++) {
-            x = 40 + i * 10;
-            try { baye.setFont(i); } catch (e) { }
-            baye.drawText(x, y, String(i), 1);
-        }
-        /*复原 */
-        try { baye.setFont(0); } catch (e2) { }
-
-        /* ── 第二行：常见 RGB 值当作索引试（有些引擎支持 0xRRGGBB）── */
-        y = 50;
-        baye.drawText(6, y, 'RGB试:', 1);
-        var rgbs = [0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF];
-        for (i = 0; i < rgbs.length; i++) {
-            x = 46 + i * 24;
-            try { baye.setFont(rgbs[i]); } catch (e3) { }
-            baye.drawText(x, y, String(rgbs[i]), 1);
-        }
-        try { baye.setFont(0); } catch (e4) { }
-
-        /* ── 第三行：16~31（有些引擎索引更大）── */
-        y = 66;
-        baye.drawText(6, y, '16+:', 1);
-        for (i = 16; i <= 31; i++) {
-            x = 36 + (i - 16) * 10;
-            try { baye.setFont(i); } catch (e5) { }
-            baye.drawText(x, y, String(i), 1);
-        }
-        try { baye.setFont(0); } catch (e6) { }
-
-        /* ── 第四行：drawText 的第4参数（mode）是否是「是否着色」── */
-        y = 82;
-        baye.drawText(6, y, 'mode:', 1);
-        for (i = 0; i <= 5; i++) {
-            x = 40 + i * 22;
-            baye.drawText(x, y, 'm' + i, i);/* mode 传i */
-        }
-
-        baye.drawText(6, 100, '按确认 → 测菜单能否染色', 1);
-        baye.drawText(6, 112, '按取消 → 回主菜单', 1);
-
-        /* 监听确认键 */
-        var oldSel = baye.hooks.willChangeMenuSelection;
-        var stage = 0;
-        baye.hooks.willChangeMenuSelection = function () {
-            if (stage === 0) {
-                stage = 1;
-                /* 关键测试：setFont(红色索引) 后开菜单，看菜单项文字是否变色 */
-                try { baye.setFont(1); } catch (e7) { }
-                menu([
-                    '若这行是红色→菜单可染色',
-                    '若这行是白色→菜单不可染色',
-                    '────────────────',
-                    '返回配色图'
-                ], 0, function (ind) {
-                    baye.hooks.willChangeMenuSelection = oldSel;
-                    if (ind === 0 || ind === 1 || ind === 2 || ind === undefined) { colorProbe(); return; }
-                    try { baye.setFont(0); } catch (e8) { }
-                    onShowMainHelp();
-                });
-            }
-        };
-        baye.hooks.willCloseMenu = function () {
-            if (stage === 0) { baye.hooks.willChangeMenuSelection = oldSel; }
-        };
+    /* 强化等级说明页（替代探测菜单） */
+    function forgeColorHelp() {
+        menu([
+            '━━ 强化配色说明 ━━', '',
+            '强化等级越高，颜色越炫', '',
+            '+1~+3　白（默认）',
+            '+4~+6　' + FORGE_COLOR_TIER[1],
+            '+7~+9　' + FORGE_COLOR_TIER[2],
+            '+10~+11　' + FORGE_COLOR_TIER[3],
+            '+12　　' + FORGE_COLOR_TIER[4],
+            '+13　　' + FORGE_COLOR_TIER[4] + ' ✦亮光',
+            '+14~+15　' + FORGE_COLOR_TIER[5], '',
+            '⚠ 需在引擎菜单切到「彩色」',
+            '　（黑白模式下不显示颜色）', '',
+            '─ 返回 ─'
+        ], 0, function () { onShowMainHelp(); }, function () { forgeColorHelp(); });
     }
 
     /* ---------- 势力君主名（v1.20.5 定稿）----------

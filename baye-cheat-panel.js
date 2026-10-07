@@ -27,7 +27,7 @@
         return;
     }
 
-    var CHEAT_VERSION = '1.23.0-probe';
+    var CHEAT_VERSION = '1.23.0-probe2';
 
     function ready() {
         return window.baye && window.baye.hooks && window.baye.data;
@@ -3194,47 +3194,88 @@
              ③ baye.setFont 存在但源码无调用示例
        待测：setFont 的签名、centerChoose 项能否带颜色、data 里有没有颜色字段。 */
     function colorProbe() {
-        var out = [], i;
-        function p2() { out.push([].slice.call(arguments).join(' ')); }
-        p2('=== drawText 第4参数（着色模式）===');
-        for (i = 0; i <= 20; i++) {
-            try { baye.drawText(2, 2, 'T' + i, i); p2('  mode=' + i + ' OK'); }
-            catch (e) { p2('  mode=' + i + ' 报错'); }
+        /* ---------- 彩色可视化探测 v2（v1.23.0-probe2）----------
+           v1 已确认：baye.setFont(n) = 设置字体颜色索引（控制台会打「set cn ... font to N」）。
+           这轮直接**画出来**，用眼睛确认：
+             ① 索引 0~15 哪些真的有颜色
+             ② 菜单（centerChoose）文字能不能被 setFont 染色 */
+        var i, x, y, W = SW(), H = SH();
+        baye.clearRect(0, 0, W, H);
+        baye.drawRect(0, 0, W, H);
+        baye.drawRect(2, 2, W - 3, H - 3);
+
+        /* 标题（不染色） */
+        baye.setFont(0);
+        baye.drawText(6, 6, '彩色探测 v2', 1);
+        baye.drawText(6, 18, 'setFont(n) = 颜色索引 n', 1);
+
+        /* ── 第一行：0~15 每个索引各画一个数字 ── */
+        y = 34;
+        baye.drawText(6, y - 2, '索引:', 1);
+        for (i = 0; i <= 15; i++) {
+            x = 40 + i * 10;
+            try { baye.setFont(i); } catch (e) { }
+            baye.drawText(x, y, String(i), 1);
         }
-        p2('=== baye.setFont===');
-        p2('  typeof=' + typeof baye.setFont);
-        if (typeof baye.setFont === 'function') {
-            p2('  参数个数=' + baye.setFont.length);
-            var tries = [
-                ['#ff0000', function () { return baye.setFont('#ff0000'); }],
-                ['255,0,0', function () { return baye.setFont('255,0,0'); }],
-                ['3数字', function () { return baye.setFont(255, 0, 0); }],
-                ['1数字', function () { return baye.setFont(1); }],
-                ['对象', function () { return baye.setFont({ color: '#f00' }); }]
-            ];
-            for (i = 0; i < tries.length; i++) {
-                try {
-                    var r = tries[i][1]();
-                    p2('  ' + tries[i][0] + ' → OK 返回=' + JSON.stringify(r));
-                } catch (e) { p2('  ' + tries[i][0] + ' → 报错'); }
+        /*复原 */
+        try { baye.setFont(0); } catch (e2) { }
+
+        /* ── 第二行：常见 RGB 值当作索引试（有些引擎支持 0xRRGGBB）── */
+        y = 50;
+        baye.drawText(6, y, 'RGB试:', 1);
+        var rgbs = [0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF];
+        for (i = 0; i < rgbs.length; i++) {
+            x = 46 + i * 24;
+            try { baye.setFont(rgbs[i]); } catch (e3) { }
+            baye.drawText(x, y, String(rgbs[i]), 1);
+        }
+        try { baye.setFont(0); } catch (e4) { }
+
+        /* ── 第三行：16~31（有些引擎索引更大）── */
+        y = 66;
+        baye.drawText(6, y, '16+:', 1);
+        for (i = 16; i <= 31; i++) {
+            x = 36 + (i - 16) * 10;
+            try { baye.setFont(i); } catch (e5) { }
+            baye.drawText(x, y, String(i), 1);
+        }
+        try { baye.setFont(0); } catch (e6) { }
+
+        /* ── 第四行：drawText 的第4参数（mode）是否是「是否着色」── */
+        y = 82;
+        baye.drawText(6, y, 'mode:', 1);
+        for (i = 0; i <= 5; i++) {
+            x = 40 + i * 22;
+            baye.drawText(x, y, 'm' + i, i);/* mode 传i */
+        }
+
+        baye.drawText(6, 100, '按确认 → 测菜单能否染色', 1);
+        baye.drawText(6, 112, '按取消 → 回主菜单', 1);
+
+        /* 监听确认键 */
+        var oldSel = baye.hooks.willChangeMenuSelection;
+        var stage = 0;
+        baye.hooks.willChangeMenuSelection = function () {
+            if (stage === 0) {
+                stage = 1;
+                /* 关键测试：setFont(红色索引) 后开菜单，看菜单项文字是否变色 */
+                try { baye.setFont(1); } catch (e7) { }
+                menu([
+                    '若这行是红色→菜单可染色',
+                    '若这行是白色→菜单不可染色',
+                    '────────────────',
+                    '返回配色图'
+                ], 0, function (ind) {
+                    baye.hooks.willChangeMenuSelection = oldSel;
+                    if (ind === 0 || ind === 1 || ind === 2 || ind === undefined) { colorProbe(); return; }
+                    try { baye.setFont(0); } catch (e8) { }
+                    onShowMainHelp();
+                });
             }
-        }
-        p2('=== baye.data 颜色字段 ===');
-        try {
-            var ks = Object.keys(baye.data).filter(function (k) {
-                return /col|rgb|theme|paint/i.test(k);
-            });
-            p2('  ' + (ks.length ? ks.join(', ') : '（无）'));
-        } catch (e) { p2('  读取失败'); }
-        p2('=== 中心框尺寸 ===');
-        p2('  g_screenWidth=' + baye.data.g_screenWidth + ' g_screenHeight=' + baye.data.g_screenHeight);
-        try { p2('  探测 drawText 长度: ' + baye.drawText.length); } catch (e) { }
-        log('彩色探测:\n' + out.join('\n'));
-        menu(['彩色探测结果（详见控制台）', ''].concat(
-            out.filter(function (x) { return x.indexOf('===') >= 0 || x.indexOf('typeof') >= 0
-                || x.indexOf('参数个数') >= 0 || x.indexOf('g_screen') >= 0
-                || x.indexOf('颜色字段') >= 0 || x.indexOf('OK 返回') >= 0; })
-        ).concat(['', '─ 返回 ─']), 24, function () { versionDialog(); });
+        };
+        baye.hooks.willCloseMenu = function () {
+            if (stage === 0) { baye.hooks.willChangeMenuSelection = oldSel; }
+        };
     }
 
     /* ---------- 势力君主名（v1.20.5 定稿）----------
